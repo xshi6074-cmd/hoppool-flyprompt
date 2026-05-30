@@ -5,6 +5,7 @@ import random
 import sys
 import time
 import math
+import wandb
 from collections import defaultdict
 
 import numpy as np
@@ -57,11 +58,17 @@ class _Trainer():
 
         # Distributed training setup
         self.world_size = 1
-        self.ngpus_per_nodes = torch.cuda.device_count()
+        # Number of GPUs available on this node. Use max(1, ...) to avoid
+        # division/modulo by zero when running on CPU-only machines.
+        detected_gpus = torch.cuda.device_count()
+        self.ngpus_per_nodes = max(1, detected_gpus)
+        # Flag indicating whether CUDA is actually available
+        self.cuda_available = detected_gpus > 0
+
         if "WORLD_SIZE" in os.environ and os.environ["WORLD_SIZE"] != '':
-            self.world_size  = int(os.environ["WORLD_SIZE"]) * self.ngpus_per_nodes
+            self.world_size = int(os.environ["WORLD_SIZE"]) * self.ngpus_per_nodes
         else:
-            self.world_size  = self.world_size * self.ngpus_per_nodes
+            self.world_size = self.world_size * self.ngpus_per_nodes
 
         self.distributed = self.world_size > 1
         self.dist_backend = 'nccl'
@@ -72,6 +79,15 @@ class _Trainer():
         self.log_dir = f"{self.log_path}/logs/{self.dataset}/{self.note}"
 
         os.makedirs(self.log_dir, exist_ok=True)
+
+        self.wandb_run = None
+        if getattr(self, "use_wandb", False) and self.is_main_process():
+            self.wandb_run = wandb.init(
+                entity=self.wandb_entity,
+                project=self.wandb_project,
+                config=kwargs,
+                name=self.note if self.note else None
+            )
 
         return
 
@@ -230,34 +246,39 @@ class _Trainer():
 
     def main_worker(self, gpu) -> None:
         # ========= Distributed training setup =========
-        self.gpu    = gpu % self.ngpus_per_nodes
-        self.device = torch.device(self.gpu)
-        if self.distributed:
-            self.local_rank = self.gpu
-            if 'SLURM_PROCID' in os.environ.keys():
-                self.rank = int(os.environ['SLURM_PROCID']) * self.ngpus_per_nodes + self.gpu
-                logger.info(f"| Init Process group {os.environ['SLURM_PROCID']} : {self.local_rank}")
-            else :
-                self.rank = self.gpu
-                logger.info(f"| Init Process group 0 : {self.local_rank}")
-            if 'MASTER_ADDR' not in os.environ.keys():
-                os.environ['MASTER_ADDR'] = '127.0.0.1'
-                os.environ['MASTER_PORT'] = '12702'
-            torch.cuda.set_device(self.gpu)
-            time.sleep(self.rank * 0.1) # prevent port collision
-            dist.init_process_group(backend=self.dist_backend, init_method=self.dist_url,
-                                    world_size=self.world_size, rank=self.rank)
-            torch.distributed.barrier()
-            self.setup_for_distributed(self.is_main_process())
+        # If CUDA is not available, run on CPU and skip CUDA/distributed setup.
+        if not getattr(self, 'cuda_available', False):
+            self.gpu = None
+            self.device = torch.device('cpu')
+            self.distributed = False
         else:
-            pass
+            self.gpu = gpu % self.ngpus_per_nodes
+            self.device = torch.device(f'cuda:{self.gpu}')
+            if self.distributed:
+                self.local_rank = self.gpu
+                if 'SLURM_PROCID' in os.environ.keys():
+                    self.rank = int(os.environ['SLURM_PROCID']) * self.ngpus_per_nodes + self.gpu
+                    logger.info(f"| Init Process group {os.environ['SLURM_PROCID']} : {self.local_rank}")
+                else :
+                    self.rank = self.gpu
+                    logger.info(f"| Init Process group 0 : {self.local_rank}")
+                if 'MASTER_ADDR' not in os.environ.keys():
+                    os.environ['MASTER_ADDR'] = '127.0.0.1'
+                    os.environ['MASTER_PORT'] = '12702'
+                torch.cuda.set_device(self.gpu)
+                time.sleep(self.rank * 0.1) # prevent port collision
+                dist.init_process_group(backend=self.dist_backend, init_method=self.dist_url,
+                                        world_size=self.world_size, rank=self.rank)
+                torch.distributed.barrier()
+                self.setup_for_distributed(self.is_main_process())
 
         if self.rnd_seed is not None:
             random.seed(self.rnd_seed)
             np.random.seed(self.rnd_seed)
             torch.manual_seed(self.rnd_seed)
-            torch.cuda.manual_seed(self.rnd_seed)
-            torch.cuda.manual_seed_all(self.rnd_seed) # if use multi-GPU
+            if getattr(self, 'cuda_available', False):
+                torch.cuda.manual_seed(self.rnd_seed)
+                torch.cuda.manual_seed_all(self.rnd_seed) # if use multi-GPU
             cudnn.deterministic = True
             logger.info(
                 'You have chosen to seed training. '
@@ -409,37 +430,46 @@ class _Trainer():
                         "[Post] analysis_expert_similarity=True but method has no "
                         "analyze_expert_features; skipping expert analysis."
                     )
+            
+            if self.wandb_run:
+                self.wandb_run.finish()
 
     def profile_worker(self, gpu) -> None:
         # ============ Toy experiment setup ============
-        self.gpu    = gpu % self.ngpus_per_nodes
-        self.device = torch.device(self.gpu)
-        if self.distributed:
-            self.local_rank = self.gpu
-            if 'SLURM_PROCID' in os.environ.keys():
-                self.rank = int(os.environ['SLURM_PROCID']) * self.ngpus_per_nodes + self.gpu
-                logger.info(f"| Init Process group {os.environ['SLURM_PROCID']} : {self.local_rank}")
-            else :
-                self.rank = self.gpu
-                logger.info(f"| Init Process group 0 : {self.local_rank}")
-            if 'MASTER_ADDR' not in os.environ.keys():
-                os.environ['MASTER_ADDR'] = '127.0.0.1'
-                os.environ['MASTER_PORT'] = '12702'
-            torch.cuda.set_device(self.gpu)
-            time.sleep(self.rank * 0.1) # prevent port collision
-            dist.init_process_group(backend=self.dist_backend, init_method=self.dist_url,
-                                    world_size=self.world_size, rank=self.rank)
-            torch.distributed.barrier()
-            self.setup_for_distributed(self.is_main_process())
+        if not getattr(self, 'cuda_available', False):
+            self.gpu = None
+            self.device = torch.device('cpu')
+            self.distributed = False
         else:
-            pass
+            self.gpu    = gpu % self.ngpus_per_nodes
+            self.device = torch.device(self.gpu)
+            if self.distributed:
+                self.local_rank = self.gpu
+                if 'SLURM_PROCID' in os.environ.keys():
+                    self.rank = int(os.environ['SLURM_PROCID']) * self.ngpus_per_nodes + self.gpu
+                    logger.info(f"| Init Process group {os.environ['SLURM_PROCID']} : {self.local_rank}")
+                else :
+                    self.rank = self.gpu
+                    logger.info(f"| Init Process group 0 : {self.local_rank}")
+                if 'MASTER_ADDR' not in os.environ.keys():
+                    os.environ['MASTER_ADDR'] = '127.0.0.1'
+                    os.environ['MASTER_PORT'] = '12702'
+                torch.cuda.set_device(self.gpu)
+                time.sleep(self.rank * 0.1) # prevent port collision
+                dist.init_process_group(backend=self.dist_backend, init_method=self.dist_url,
+                                        world_size=self.world_size, rank=self.rank)
+                torch.distributed.barrier()
+                self.setup_for_distributed(self.is_main_process())
+            else:
+                pass
 
         if self.rnd_seed is not None:
             random.seed(self.rnd_seed)
             np.random.seed(self.rnd_seed)
             torch.manual_seed(self.rnd_seed)
-            torch.cuda.manual_seed(self.rnd_seed)
-            torch.cuda.manual_seed_all(self.rnd_seed) # if use multi-GPU
+            if getattr(self, 'cuda_available', False):
+                torch.cuda.manual_seed(self.rnd_seed)
+                torch.cuda.manual_seed_all(self.rnd_seed) # if use multi-GPU
             cudnn.deterministic = True
         cudnn.benchmark = False
 
@@ -549,11 +579,24 @@ class _Trainer():
             f"running_time {datetime.timedelta(seconds=int(time.time() - self.start_time))} | "
             f"ETA {datetime.timedelta(seconds=int((time.time() - self.start_time) * (self.total_samples*self.num_epochs-sample_num) / sample_num))}"
         )
+        if self.wandb_run:
+            self.wandb_run.log({
+                "train/loss": train_loss,
+                "train/acc": train_acc,
+                "train/lr": self.optimizer.param_groups[0]['lr'],
+                "sample_num": sample_num
+            })
 
     def report_test(self, sample_num, avg_loss, avg_acc):
         logger.info(
             f"Test | Sample # {sample_num} | test_loss {avg_loss:.4f} | test_acc {avg_acc:.4f} | "
         )
+        if self.wandb_run:
+            self.wandb_run.log({
+                "test/loss": avg_loss,
+                "test/acc": avg_acc,
+                "sample_num": sample_num
+            })
 
     def _interpret_pred(self, y, pred):
         # xlable is batch

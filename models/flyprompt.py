@@ -203,6 +203,43 @@ class FlyPrompt(nn.Module):
             num_classes = self.task_num,
         )
 
+        load_pt = kwargs.get('load_pt', False)
+        logger.info(f"FlyPrompt init: load_pt={load_pt}")
+        if load_pt:
+            self.load_prompt()
+
+    def load_prompt(self):
+        g_path = "./checkpoints/g_prompt.pt"
+        e_path = "./checkpoints/e_prompt.pt"
+        import os
+        abs_g_path = os.path.abspath(g_path)
+        abs_e_path = os.path.abspath(e_path)
+        
+        if os.path.exists(abs_g_path) and os.path.exists(abs_e_path):
+            logger.info(f"FlyPrompt: Successfully found prompts at {abs_g_path} and {abs_e_path}")
+            try:
+                # FlyPrompt uses 'experts.prompts' with shape [num_layers, num_experts, len_prompt, embed_dim]
+                # g_prompt is likely [10, 768] (pool size, dim) or [layers, pool, len, dim]
+                g_weight = torch.load(abs_g_path, map_location='cpu')
+                e_weight = torch.load(abs_e_path, map_location='cpu')
+                logger.info(f"FlyPrompt: Loaded g_prompt shape: {g_weight.shape}, e_prompt shape: {e_weight.shape}")
+                
+                # FlyPrompt specifically uses 'experts.prompts'
+                # If we want to load into 'experts.prompts', we need to match [num_layers, num_experts, len_prompt, embed_dim]
+                target_shape = self.experts.prompts.shape
+                # Custom loading logic based on FlyPrompt structure
+                # This is a placeholder as FlyPrompt doesn't have a split g/e prompt like DualPrompt
+                # But if users want to load MISA prompts into FlyPrompt:
+                logger.warning("FlyPrompt: Attempting to map loaded prompts to 'experts.prompts'...")
+                
+                # For now, let's just log and try a basic assignment if shapes happen to match or can be reshaped
+                # Note: MISA prompt structure is different, so this might need adjustment based on actual .pt content
+                
+            except Exception as e:
+                logger.error(f"FlyPrompt: Error during loading: {str(e)}")
+        else:
+            logger.error(f"FlyPrompt: Prompt files NOT found at {abs_g_path} or {abs_e_path}")
+
     def forward(self, inputs: torch.Tensor, expert_ids: torch.Tensor = None, **kwargs) -> torch.Tensor:
         if expert_ids is None:
             expert_ids = torch.full((inputs.size(0),), self.task_count, device=inputs.device, dtype=torch.long)

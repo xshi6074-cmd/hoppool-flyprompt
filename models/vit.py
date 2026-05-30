@@ -37,6 +37,8 @@ from timm.models.layers import (DropPath, Mlp, PatchEmbed, lecun_normal_,
                                 trunc_normal_)
 from timm.models.registry import register_model
 
+from hflayers import HopfieldPooling
+
 _logger = logging.getLogger(__name__)
 
 
@@ -508,7 +510,71 @@ class VisionTransformer(nn.Module):
         x = self.forward_head(x)
         return x
 
-
+class HopfieldPoolingViT(VisionTransformer):
+    
+    def __init__(self,num_pooling_heads=1,num_pooling_depth=3,prompt_length=30,embedding_key='cls',head_type='token',top_k=1,deep_prompts=0,**kwargs):
+         
+         super().__init__(**kwargs)
+         
+         self.num_pooling_heads=num_pooling_heads
+         self.num_pooling_depth=num_pooling_depth
+         self.prompt_length=prompt_length
+         self.embedding_key=embedding_key
+         self.head_type=head_type
+         self.top_k=top_k
+         self.deep_prompts=deep_prompts
+         
+         self.hopfield_pooling_layers=nn.ModuleList([
+             HopfieldPooling(
+                    input_size=self.embed_dim,
+                    hidden_size=self.embed_dim,
+                    update_steps_max=0,
+                    quantity=prompt_length,
+                    num_heads=num_pooling_heads,
+                    stored_pattern_as_static=False,
+                    pattern_projection_as_static=True,
+                    state_pattern_as_static=False,
+             )for _ in range(self.num_pooling_depth)
+         ])
+         
+    def forward_features(self, x, task_id=-1,cls_features=None,train=False, return_prompts=False):
+         B=x.shape[0]
+         x=self.patch_embed(x)
+         res=dict()
+         prompts=[]
+        
+         if self.cls_token is not None:
+             x=torch.cat((self.cls_token.expand(B,-1,-1),x),dim=1)
+             
+         x = self.pos_drop(x + self.pos_embed)
+         
+         if hasattr(self, 'hopfield_pooling_layers'): 
+            if self.deep_prompts == 1:
+                for i in range(len(self.blocks) - self.num_pooling_depth):
+                    x = self.blocks[i](x)
+                
+                for j, i in enumerate(range(len(self.blocks) - self.num_pooling_depth, self.len(self.blocks))):
+                    prompt = self.hopfield_pooling_layers[j](x).view(B, self.prompt_length, self.embed_dim)
+                    
+                    x = torch.cat([x[:,:1], prompt, x[:,1:]], dim=1)  
+                    x = self.blocks[i](x)  
+                    x = torch.cat([x[:,:1], x[:, self.prompt_length+1:]], dim=1)  
+            else:
+                for i in range(self.num_pooling_depth):
+                    prompt = self.hopfield_pooling_layers[i](x).view(B, self.prompt_length, self.embed_dim)
+                    
+                    x = torch.cat([x[:,:1], prompt, x[:,1:]], dim=1)  
+                    x = self.blocks[i](x)  
+                    x = torch.cat([x[:,:1], x[:, self.prompt_length+1:]], dim=1)  
+                
+                for blk in self.blocks[self.num_pooling_depth:]:
+                    x = blk(x)
+        else:
+            x = self.blocks(x)
+            
+        x = self.norm(x)
+        return x
+     
 def init_weights_vit_timm(module: nn.Module, name: str = ''):
     """ ViT weight initialization, original timm impl (for reproducibility) """
     if isinstance(module, nn.Linear):
@@ -704,7 +770,7 @@ def checkpoint_filter_fn(state_dict, model, adapt_layer_scale=False):
     return out_dict
 
 
-def _create_vision_transformer(variant, pretrained=False, **kwargs):
+def _create_vision_transformer(variant, pretrained=False,  if_pooling=False, **kwargs):
     if kwargs.get('features_only', None):
         raise RuntimeError('features_only not implemented for Vision Transformer models.')
 
@@ -761,12 +827,20 @@ def _create_vision_transformer(variant, pretrained=False, **kwargs):
 
     _logger.info(pretrained_cfg)
 
-    model = build_model_with_cfg(
-        VisionTransformer, variant, pretrained,
-        pretrained_cfg=pretrained_cfg,
-        pretrained_filter_fn=checkpoint_filter_fn,
-        **kwargs)
-    return model
+    if not if_pooling:
+        model = build_model_with_cfg(
+            VisionTransformer, variant, pretrained,
+            pretrained_cfg=pretrained_cfg,
+            pretrained_filter_fn=checkpoint_filter_fn,
+            **kwargs)
+        return model
+    else:
+        model = build_model_with_cfg(
+            HopfieldPoolingViT, variant, pretrained,
+            pretrained_cfg=pretrained_cfg,
+            pretrained_filter_fn=checkpoint_filter_fn,
+            **kwargs)
+        return model
 
 
 @register_model
@@ -1382,3 +1456,10 @@ def vit_base_patch16_224_mepo_ibot_21k(pretrained=False, **kwargs):
         except Exception as e:
             _logger.warning('Failed to load iBOT-style MEPO (21k) weights from local checkpoint: %s', e)
     return model
+
+@register_model
+def vit_base_patch16_224_hfpooling(pretrained=False, **kwargs):
+    
+     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
+     model=_create_vision_transformer('vit_base_patch16_224_hfpooling',pretrained=False,if_pooling=True,**model_kwargs)
+     return model

@@ -26,3 +26,5 @@ tqdm==4.65.2
 
 # Optional: For development and analysis
 # jupyter==1.1.1  # Uncomment if you need Jupyter notebooks
+
+git+https://github.com/ml-jku/hopfield-layers

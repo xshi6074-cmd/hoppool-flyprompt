@@ -46,7 +46,9 @@ def base_parser():
 
     # ============= ViT configurations =============
     parser.add_argument('--profile', action='store_true', default=False, help='enable profiling for ViT_Prompt')
-
+    parser.add_argument('--deep_prompts',default=0)
+    parser.add_argument('--num_pooling_depth',default=3)
+    
     # ============= MISA configurations ============
     parser.add_argument('--load_pt', action='store_true', default=False, help='load pretrained prompts (MISA)')
 
@@ -89,6 +91,11 @@ def base_parser():
     # ======== Expert similarity analysis ==========
     parser.add_argument("--analysis_expert_similarity", action="store_true", default=False,
                         help="If set, run expert feature similarity / CKA (including residual vs common) analysis after training.")
+
+    # ========== WandB configurations ==========
+    parser.add_argument("--use_wandb", action="store_true", default=False, help="Use Weights & Biases for logging.")
+    parser.add_argument("--wandb_entity", type=str, default="xshi6074-tsinghua-university", help="WandB entity.")
+    parser.add_argument("--wandb_project", type=str, default="flyprompt", help="WandB project.")
 
     args = parser.parse_args()
     return args

@@ -200,30 +200,73 @@ class DualPrompt(nn.Module):
         else: raise ValueError('Unknown prompt_func: {}'.format(prompt_func))
         self.g_prompt.key = None
 
+        logger.info(f"DualPrompt init: load_pt={load_pt}")
         self.load_prompt(load_pt)
 
     def load_prompt(self, load_pt: bool = False,):
         g_path = "./checkpoints/g_prompt.pt"
         e_path = "./checkpoints/e_prompt.pt"
         if load_pt:
-            logger.info(f"load prompt from {g_path} and {e_path}")
-            g_prompt = torch.load(g_path)
-            e_prompt = torch.load(e_path)
-            self.g_prompt.prompts = nn.Parameter(g_prompt.detach().clone())
+            import os
+            # Use absolute path resolving for cloud environments
+            abs_g_path = os.path.abspath(g_path)
+            abs_e_path = os.path.abspath(e_path)
+            
+            if os.path.exists(abs_g_path) and os.path.exists(abs_e_path):
+                logger.info(f"Successfully found prompts at {abs_g_path} and {abs_e_path}")
+                try:
+                    g_prompt = torch.load(abs_g_path, map_location='cpu')
+                    e_prompt = torch.load(abs_e_path, map_location='cpu')
+                    
+                    logger.info(f"Loaded g_prompt shape: {g_prompt.shape}, e_prompt shape: {e_prompt.shape}")
+                    
+                    # g_prompt in MISA is typically [10, 768] (pool size 10)
+                    # Our DualPrompt's g_prompt.prompts is [g_pool, g_len, dim]
+                    # By default g_pool=1, g_len=5 (total 5 tokens per layer)
+                    # If load_pt=True, len_g_prompt was forced to 10 earlier.
+                    
+                    target_g_shape = self.g_prompt.prompts.shape
+                    if g_prompt.shape == target_g_shape:
+                        self.g_prompt.prompts = nn.Parameter(g_prompt.detach().to(self.g_prompt.prompts.device))
+                    else:
+                        # Reshape if it's the flattened version [pool*len, dim] -> [pool, len, dim]
+                        try:
+                            reshaped_g = g_prompt.detach().view(target_g_shape)
+                            self.g_prompt.prompts = nn.Parameter(reshaped_g.to(self.g_prompt.prompts.device))
+                            logger.info(f"Reshaped g_prompt to {target_g_shape}")
+                        except Exception as e:
+                            logger.error(f"Failed to load g_prompt due to shape mismatch: {g_prompt.shape} vs {target_g_shape}")
 
-            # e_prompt in checkpoints is assumed to have pool size 10. When the
-            # current model uses a larger expert pool (e.g., e_pool=20 for
-            # step_num/task_num=20), tile the loaded prompts along the pool
-            # dimension so that shapes match.
-            e_prompt = e_prompt.detach()
-            if e_prompt.dim() == 3:
-                old_e_pool = e_prompt.size(0)
-                new_e_pool = self.e_pool
-                if old_e_pool != new_e_pool:
-                    # Tile along pool dimension until reaching new_e_pool
-                    repeat_factor = (new_e_pool + old_e_pool - 1) // old_e_pool
-                    e_prompt = e_prompt.repeat(repeat_factor, 1, 1)[:new_e_pool]
-            self.e_prompt.prompts = nn.Parameter(e_prompt.clone())
+                    # e_prompt loading logic
+                    e_prompt = e_prompt.detach()
+                    # Standard MISA e_prompt is [10, 20*layer_num, 768] or similar
+                    # Our e_prompt.prompts shape: [e_pool, e_len*layer_num, dim]
+                    
+                    if e_prompt.dim() == 3:
+                        old_e_pool = e_prompt.size(0)
+                        new_e_pool = self.e_pool
+                        if old_e_pool != new_e_pool:
+                            repeat_factor = (new_e_pool + old_e_pool - 1) // old_e_pool
+                            e_prompt = e_prompt.repeat(repeat_factor, 1, 1)[:new_e_pool]
+                        
+                        target_e_shape = self.e_prompt.prompts.shape
+                        if e_prompt.shape == target_e_shape:
+                            self.e_prompt.prompts = nn.Parameter(e_prompt.to(self.e_prompt.prompts.device))
+                            logger.info(f"Successfully assigned e_prompt with pool size {new_e_pool}")
+                        else:
+                            logger.error(f"e_prompt shape mismatch after tiling: {e_prompt.shape} vs {target_e_shape}")
+                except Exception as e:
+                    logger.error(f"Error during torch.load: {str(e)}")
+            else:
+                logger.error(f"CRITICAL: Prompt files NOT found!")
+                logger.error(f"Checked path: {abs_g_path}")
+                logger.error(f"Checked path: {abs_e_path}")
+                # Optional: list parent directory for debugging
+                parent_dir = os.path.dirname(abs_g_path)
+                if os.path.exists(parent_dir):
+                    logger.info(f"Directory {parent_dir} contains: {os.listdir(parent_dir)}")
+                else:
+                    logger.warning(f"Directory {parent_dir} does not exist!")
 
     def prompt_tuning(self,
                       x        : torch.Tensor,
