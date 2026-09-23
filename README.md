@@ -17,7 +17,7 @@ FlyGCL is a practical framework for **General Continual Learning (GCL) / online 
 
 ## 📦 What's included
 
-- **Methods**: `flyprompt` (ours), `l2p`, `dualprompt`, `codaprompt`, `mvp`, `misa`, `slca`, `sprompt`, `ranpac`, `hide` (prompt/lora/adapter), `norga`, `sdlora`
+- **Methods**: `flyprompt` (ours), mechanism ablations `baseline` / `shared_prompt` / `hfpool` / `gate` / `mlp_generator` (see [Mechanism ablation methods](#-mechanism-ablation-methods)), `l2p`, `dualprompt`, `codaprompt`, `mvp`, `misa`, `slca`, `sprompt`, `ranpac`, `hide` (prompt/lora/adapter), `norga`, `sdlora`
 - **Backbones**: ViT via `timm` and a local ViT implementation (`models/vit.py`) supporting multiple pretrained sources
 - **Setting**: true online Si-Blurry with configurable disjoint/blurry ratios
 - **Outputs**: logs and numpy/json artifacts under `results/`
@@ -66,6 +66,20 @@ You may change the root path by:
 
 - **CLI**: `--data_dir /your/path`
 - **Baseline scripts**: set `DATA_ROOT=/your/path` (scripts use `${DATA_ROOT}/CIFAR`, `${DATA_ROOT}/imagenet-r`, `${DATA_ROOT}/CUB_200_2011` by default)
+
+For an already extracted CIFAR-100 archive, `--data_dir` may point either to
+the parent directory or directly to the `cifar-100-python/` directory:
+
+```bash
+python main.py --dataset cifar100 \
+  --data_dir /data/datasets/cifar-100-python \
+  --gpu 0
+```
+
+When the local `cifar-100-python/` directory exists, FlyGCL reads its
+`train`, `test`, and `meta` files without attempting a download. An incomplete
+or corrupted local copy fails with an error instead of triggering a network
+request.
 
 ### Download links (common benchmarks)
 
@@ -123,6 +137,18 @@ When you set `--backbone` to one of the following, `models/vit.py` will try to l
 | DINO-1K     | `vit_base_patch16_224_dino`        | `dino_vitbase16_pretrain.pth`                     |
 | MoCo v3-1K  | `vit_base_patch16_224_mocov3`      | `mocov3-vit-base-300ep.pth` (expects key `model`) |
 
+To avoid relying on `./checkpoints` or the user cache, pass the exact local
+weight file explicitly:
+
+```bash
+python main.py \
+  --backbone vit_base_patch16_224 \
+  --backbone_path /absolute/path/to/ViT-B_16.npz
+```
+
+`--backbone_path` initializes only the pretrained backbone. It does not restore
+an optimizer, seed progress, or other state from a complete training run.
+
 ### Prompt checkpoints (MISA)
 
 `MISA` (based on `DualPrompt`) loads prompt tensors from local files when you pass `--load_pt`:
@@ -163,6 +189,51 @@ python main.py \
   --use_amp --eval_period 1000 \
   --note flyprompt_imagenet_r
 ```
+
+## 🔬 Mechanism ablation methods
+
+All of these freeze the ViT backbone and train the online FC. Except for
+`flyprompt`, none of them use REAR routing. `--use_ema` adds EMA heads: one
+bank per expert for `flyprompt`, one global bank for `baseline`,
+`shared_prompt`, `hfpool` and `gate`.
+
+| `--method` | What trains besides the FC | Key arguments |
+| --- | --- | --- |
+| `baseline` | nothing (frozen ViT + FC) | — |
+| `flyprompt` | task-wise prompt experts, routed by REAR | `--len_prompt` `--pos_prompt` `--use_ema` |
+| `shared_prompt` | one FlyPrompt prompt shared by the stream | `--len_prompt` `--pos_prompt` `--use_ema` |
+| `hfpool` | selected Hopfield-pooling parts that generate prompts | `--hopfield_trainable {query,q,k,v,o}...` `--hopfield_input_mode {local,full_vit}` `--hopfield_start_layer` `--deep_prompts` `--num_pooling_blocks/heads` `--prompt_length` `--hopfield_grad_clip[_norm]` |
+| `gate` | per-head gain `1 + tanh(alpha)` on attention outputs | `--gate_blocks` |
+| `mlp_generator` | clean-CLS-conditioned MLP prompt generator with teacher distillation | `--prompt_blocks` `--generator_layers` `--distill_*` … |
+
+### Old → new commands
+
+Before the split these variants were `--method flyprompt` flags on the
+`hoppool_old` / `generator` branches. The old flags no longer exist.
+
+| Old command | New command |
+| --- | --- |
+| `flyprompt --disable_prompt` | `baseline` |
+| `flyprompt` (no `--use_ema`) — the "baseline" of the 2026-08-08 onward experiment log | `flyprompt` |
+| `flyprompt --shared_prompt [--use_ema]` | `shared_prompt [--use_ema]` |
+| `flyprompt --use_attention_gate --pos_prompt 0 1 2 3 4` | `gate --gate_blocks 0 1 2 3 4` |
+| `flyprompt --use_hopfield` (`--hopfield_train_mode q_projection`) | `hfpool --hopfield_trainable q` |
+| `--hopfield_train_mode pooling_queries` | `--hopfield_trainable query` |
+| `--hopfield_train_mode k_projection` | `--hopfield_trainable k` |
+| `--hopfield_train_mode output_projection` | `--hopfield_trainable o` |
+| `--hopfield_train_mode output_k_projection` | `--hopfield_trainable o k` |
+| `--hopfield_train_mode output_pooling_queries` | `--hopfield_trainable o query` |
+| `--hopfield_train_mode output_k_pooling_queries` | `--hopfield_trainable o k query` |
+| `--hopfield_train_mode all` | `--hopfield_trainable q k o` |
+| `--hopfield_start_layer` / `--hopfield_input_mode` (`codex/hf-feature-ablation`) | unchanged, on `hfpool` |
+| `--hopfield_grad_clip [--hopfield_grad_clip_norm]` | unchanged, on `hfpool` |
+| `mlp_generator ...` | unchanged |
+
+Removed without replacement: `--use_attention_pool` / `--attention_*`
+(plain cross-attention control), `--hopfield_qk_lr_scale`, `--activation` and
+the `vit_base_patch16_224_hfpooling` backbone name. The old `--use_hopfield`
+path also built an unused REAR head whose random initialisation shifted the
+random stream, so `hfpool` reruns agree with old logs only up to seed noise.
 
 ## 🏃 Running baseline scripts (`scripts/`)
 
