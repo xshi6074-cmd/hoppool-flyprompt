@@ -2,12 +2,11 @@ import logging
 import math
 
 import numpy as np
-import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import models.vit as vit
+from models.backbone import create_backbone
 from models.l2p import Prompt
 
 logger = logging.getLogger()
@@ -231,13 +230,15 @@ class RanPAC(nn.Module):
 
         # Backbone
         assert backbone_name is not None, 'backbone_name must be specified'
-        # Use custom ViT model from models.vit to support local .npz loading
-        if hasattr(vit, backbone_name):
-            logger.info(f'Using custom ViT model: {backbone_name}')
-            self.add_module('backbone', getattr(vit, backbone_name)(pretrained=True, num_classes=num_classes))
-        else:
-            logger.info(f'Using timm model: {backbone_name}')
-            self.add_module('backbone', timm.create_model(backbone_name, pretrained=True, num_classes=num_classes))
+        self.add_module(
+            'backbone',
+            create_backbone(
+                backbone_name,
+                pretrained=True,
+                num_classes=num_classes,
+                backbone_path=kwargs.get("backbone_path"),
+            ),
+        )
         for name, param in self.backbone.named_parameters():
             param.requires_grad = False
 

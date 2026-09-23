@@ -22,8 +22,6 @@ import logging
 import math
 from collections import OrderedDict
 from functools import partial
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -332,7 +330,8 @@ class VisionTransformer(nn.Module):
     def __init__(
             self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, global_pool='token',
             embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True, init_values=None,
-            class_token=True, no_embed_class=False, fc_norm=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
+            class_token=True, no_embed_class=False, fc_norm=None, drop_rate=0., attn_drop_rate=0., 
+            drop_path_rate=0., drop_block_rate=0.0,
             weight_init='', embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block,
             prompt_length=None, embedding_key='cls', prompt_init='uniform', prompt_pool=False, prompt_key=False, pool_size=None,
             top_k=None, batchwise_prompt=False, prompt_key_init='uniform', head_type='token', use_prompt_mask=False,):
@@ -708,12 +707,19 @@ def _create_vision_transformer(variant, pretrained=False, **kwargs):
     if kwargs.get('features_only', None):
         raise RuntimeError('features_only not implemented for Vision Transformer models.')
 
+    checkpoint_path = kwargs.pop('checkpoint_path', None)
     pretrained_cfg = resolve_pretrained_cfg(variant, pretrained_cfg=kwargs.pop('pretrained_cfg', None))
+    pretrained_custom_load = False
 
-    # For timm 1.0+, handle custom loading for .npz files
-    # Check if we have a local .npz file in torch cache or ./checkpoints
+    def _pretrained_cfg_value(name, default=None):
+        if isinstance(pretrained_cfg, dict):
+            return pretrained_cfg.get(name, default)
+        return getattr(pretrained_cfg, name, default)
+
+    # timm 0.6.12 selects the NumPy loader from the explicit
+    # pretrained_custom_load argument, not pretrained_cfg['custom_load'] alone.
+    # Prefer an explicit/local .npz before falling back to the configured URL.
     if pretrained:
-        import os
         from pathlib import Path
 
         # Common locations for cached .npz files
@@ -728,14 +734,21 @@ def _create_vision_transformer(variant, pretrained=False, **kwargs):
             'vit_huge_patch14_224': ['ViT-H_14.npz'],
         }
 
-        if variant in npz_filename_map:
+        npz_path = None
+        if checkpoint_path is not None:
+            npz_path = Path(checkpoint_path)
+            if npz_path.suffix.lower() != '.npz':
+                raise ValueError(
+                    f"Backbone {variant} expects an .npz checkpoint, got: "
+                    f"{npz_path}"
+                )
+        elif variant in npz_filename_map:
             # Check both ./checkpoints and torch cache
             search_paths = [
                 Path('./checkpoints'),
                 Path.home() / '.cache' / 'torch' / 'hub' / 'checkpoints'
             ]
 
-            npz_path = None
             for base_path in search_paths:
                 if not base_path.exists():
                     continue
@@ -747,26 +760,39 @@ def _create_vision_transformer(variant, pretrained=False, **kwargs):
                 if npz_path:
                     break
 
-            if npz_path:
-                _logger.info(f'Found local .npz file: {npz_path}')
-                # Set up pretrained_cfg to use custom loading with local file
-                if isinstance(pretrained_cfg, dict):
-                    pretrained_cfg['custom_load'] = True
-                    pretrained_cfg['url'] = str(npz_path)
-                    pretrained_cfg['file'] = str(npz_path)
-                else:
-                    pretrained_cfg.custom_load = True
-                    pretrained_cfg.url = str(npz_path)
-                    pretrained_cfg.file = str(npz_path)
+        if npz_path:
+            _logger.info(f'Found local .npz file: {npz_path}')
+            # Set up pretrained_cfg to use custom loading with local file
+            if isinstance(pretrained_cfg, dict):
+                pretrained_cfg['custom_load'] = True
+                pretrained_cfg['file'] = str(npz_path)
+            else:
+                pretrained_cfg.custom_load = True
+                pretrained_cfg.file = str(npz_path)
+
+        pretrained_source = (
+            _pretrained_cfg_value('file')
+            or _pretrained_cfg_value('url')
+            or ''
+        )
+        pretrained_source = str(pretrained_source).lower().split('?', 1)[0]
+        pretrained_custom_load = (
+            bool(_pretrained_cfg_value('custom_load', False))
+            or pretrained_source.endswith(('.npz', '.npy'))
+        )
 
     _logger.info(pretrained_cfg)
 
-    model = build_model_with_cfg(
-        VisionTransformer, variant, pretrained,
+    return build_model_with_cfg(
+        VisionTransformer,
+        variant,
+        pretrained,
         pretrained_cfg=pretrained_cfg,
         pretrained_filter_fn=checkpoint_filter_fn,
-        **kwargs)
-    return model
+        pretrained_custom_load=pretrained_custom_load,
+        **kwargs,
+    )
+
 
 
 @register_model
@@ -1228,20 +1254,29 @@ def vit_base_patch16_224_ibot(pretrained=False, **kwargs):
     Loads local checkpoint if pretrained=True: ./checkpoints/ibot_vitbase16_pretrain.pth
     """
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
+    explicit_checkpoint = 'checkpoint_path' in model_kwargs
+    checkpoint_path = model_kwargs.pop(
+        'checkpoint_path', './checkpoints/ibot_vitbase16_pretrain.pth')
     # Build on top of in21k variant but avoid remote downloads here
     model = _create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, **model_kwargs)
     if pretrained:
         try:
-            ckpt = torch.load('./checkpoints/ibot_vitbase16_pretrain.pth', map_location='cpu')
+            ckpt = torch.load(checkpoint_path, map_location='cpu')
             if isinstance(ckpt, dict) and 'state_dict' in ckpt:
                 ckpt = ckpt['state_dict']
             state_dict = model.state_dict()
             # keep only intersecting keys
             ckpt = {k: v for k, v in ckpt.items() if k in state_dict}
+            if explicit_checkpoint and not ckpt:
+                raise RuntimeError("No iBOT checkpoint tensors matched the backbone")
             state_dict.update(ckpt)
             model.load_state_dict(state_dict)
         except Exception as e:
-            _logger.warning('Failed to load iBOT (1k) weights from local checkpoint: %s', e)
+            if explicit_checkpoint:
+                raise RuntimeError(
+                    f"Failed to load explicit iBOT checkpoint: {checkpoint_path}"
+                ) from e
+            _logger.warning('Failed to load iBOT (1k) weights from %s: %s', checkpoint_path, e)
     return model
 
 
@@ -1251,10 +1286,13 @@ def vit_base_patch16_224_21k_ibot(pretrained=False, **kwargs):
     Loads local checkpoint if pretrained=True: ./checkpoints/checkpoint.pth (expects key 'teacher')
     """
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
+    explicit_checkpoint = 'checkpoint_path' in model_kwargs
+    checkpoint_path = model_kwargs.pop(
+        'checkpoint_path', './checkpoints/checkpoint.pth')
     model = _create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, **model_kwargs)
     if pretrained:
         try:
-            root = torch.load('./checkpoints/checkpoint.pth', map_location='cpu')
+            root = torch.load(checkpoint_path, map_location='cpu')
             s_ckpt = root['teacher'] if isinstance(root, dict) and 'teacher' in root else root
             # strip 'backbone.' prefix if present
             ckpt = {}
@@ -1263,10 +1301,16 @@ def vit_base_patch16_224_21k_ibot(pretrained=False, **kwargs):
                 ckpt[new_key] = v
             state_dict = model.state_dict()
             ckpt = {k: v for k, v in ckpt.items() if k in state_dict}
+            if explicit_checkpoint and not ckpt:
+                raise RuntimeError("No iBOT-21K checkpoint tensors matched the backbone")
             state_dict.update(ckpt)
             model.load_state_dict(state_dict)
         except Exception as e:
-            _logger.warning('Failed to load iBOT (21k) weights from local checkpoint: %s', e)
+            if explicit_checkpoint:
+                raise RuntimeError(
+                    f"Failed to load explicit iBOT-21K checkpoint: {checkpoint_path}"
+                ) from e
+            _logger.warning('Failed to load iBOT (21k) weights from %s: %s', checkpoint_path, e)
     return model
 
 
@@ -1276,17 +1320,26 @@ def vit_base_patch16_224_mocov3(pretrained=False, **kwargs):
     Loads local checkpoint if pretrained=True: ./checkpoints/mocov3-vit-base-300ep.pth
     """
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, fc_norm=True, **kwargs)
+    explicit_checkpoint = 'checkpoint_path' in model_kwargs
+    checkpoint_path = model_kwargs.pop(
+        'checkpoint_path', './checkpoints/mocov3-vit-base-300ep.pth')
     model = _create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, **model_kwargs)
     if pretrained:
         try:
-            root = torch.load('./checkpoints/mocov3-vit-base-300ep.pth', map_location='cpu')
+            root = torch.load(checkpoint_path, map_location='cpu')
             ckpt = root['model'] if isinstance(root, dict) and 'model' in root else root
             state_dict = model.state_dict()
             ckpt = {k: v for k, v in ckpt.items() if k in state_dict}
+            if explicit_checkpoint and not ckpt:
+                raise RuntimeError("No MoCo v3 checkpoint tensors matched the backbone")
             state_dict.update(ckpt)
             model.load_state_dict(state_dict)
         except Exception as e:
-            _logger.warning('Failed to load MoCo v3 weights from local checkpoint: %s', e)
+            if explicit_checkpoint:
+                raise RuntimeError(
+                    f"Failed to load explicit MoCo v3 checkpoint: {checkpoint_path}"
+                ) from e
+            _logger.warning('Failed to load MoCo v3 weights from %s: %s', checkpoint_path, e)
     return model
 
 
@@ -1298,6 +1351,7 @@ def vit_base_patch16_224_dino(pretrained=False, **kwargs):
     Optionally override path via kwarg 'checkpoint_path'.
     """
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
+    explicit_checkpoint = 'checkpoint_path' in model_kwargs
     checkpoint_path = model_kwargs.pop('checkpoint_path', './checkpoints/dino_vitbase16_pretrain.pth')
     # Build on in21k base to avoid remote downloads and keep shape-compatible backbone
     model = _create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, **model_kwargs)
@@ -1308,9 +1362,15 @@ def vit_base_patch16_224_dino(pretrained=False, **kwargs):
                 ckpt = ckpt['state_dict']
             state_dict = model.state_dict()
             ckpt = {k: v for k, v in ckpt.items() if k in state_dict}
+            if explicit_checkpoint and not ckpt:
+                raise RuntimeError("No DINO checkpoint tensors matched the backbone")
             state_dict.update(ckpt)
             model.load_state_dict(state_dict)
         except Exception as e:
+            if explicit_checkpoint:
+                raise RuntimeError(
+                    f"Failed to load explicit DINO checkpoint: {checkpoint_path}"
+                ) from e
             _logger.warning('Failed to load local DINO ViT-B/16 weights from %s: %s', checkpoint_path, e)
     return model
 
@@ -1321,20 +1381,29 @@ def vit_base_patch16_224_mepo_21k(pretrained=False, **kwargs):
     Loads local checkpoint if pretrained=True: ./checkpoints/vit_21k_mepo_epoch_0.pth
     """
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
+    explicit_checkpoint = 'checkpoint_path' in model_kwargs
+    checkpoint_path = model_kwargs.pop(
+        'checkpoint_path', './checkpoints/vit_21k_mepo_epoch_0.pth')
     # Build on top of in21k variant but avoid remote downloads here
     model = _create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, **model_kwargs)
     if pretrained:
         try:
-            ckpt = torch.load('./checkpoints/vit_21k_mepo_epoch_0.pth', map_location='cpu')
+            ckpt = torch.load(checkpoint_path, map_location='cpu')
             if isinstance(ckpt, dict) and 'state_dict' in ckpt:
                 ckpt = ckpt['state_dict']
             state_dict = model.state_dict()
             # keep only intersecting keys
             ckpt = {k: v for k, v in ckpt.items() if k in state_dict}
+            if explicit_checkpoint and not ckpt:
+                raise RuntimeError("No MePo-21K checkpoint tensors matched the backbone")
             state_dict.update(ckpt)
             model.load_state_dict(state_dict)
         except Exception as e:
-            _logger.warning('Failed to load MEPO (21k) weights from local checkpoint: %s', e)
+            if explicit_checkpoint:
+                raise RuntimeError(
+                    f"Failed to load explicit MePo-21K checkpoint: {checkpoint_path}"
+                ) from e
+            _logger.warning('Failed to load MEPO (21k) weights from %s: %s', checkpoint_path, e)
     return model
 
 
@@ -1344,20 +1413,29 @@ def vit_base_patch16_224_mepo_21k_1k(pretrained=False, **kwargs):
     Loads local checkpoint if pretrained=True: ./checkpoints/vit_21k_1k_mepo_epoch_0.pth
     """
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
+    explicit_checkpoint = 'checkpoint_path' in model_kwargs
+    checkpoint_path = model_kwargs.pop(
+        'checkpoint_path', './checkpoints/vit_21k_1k_mepo_epoch_0.pth')
     # Build on top of in21k variant but avoid remote downloads here
     model = _create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, **model_kwargs)
     if pretrained:
         try:
-            ckpt = torch.load('./checkpoints/vit_21k_1k_mepo_epoch_0.pth', map_location='cpu')
+            ckpt = torch.load(checkpoint_path, map_location='cpu')
             if isinstance(ckpt, dict) and 'state_dict' in ckpt:
                 ckpt = ckpt['state_dict']
             state_dict = model.state_dict()
             # keep only intersecting keys
             ckpt = {k: v for k, v in ckpt.items() if k in state_dict}
+            if explicit_checkpoint and not ckpt:
+                raise RuntimeError("No MePo-21K/1K checkpoint tensors matched the backbone")
             state_dict.update(ckpt)
             model.load_state_dict(state_dict)
         except Exception as e:
-            _logger.warning('Failed to load MEPO (21k->1k) weights from local checkpoint: %s', e)
+            if explicit_checkpoint:
+                raise RuntimeError(
+                    f"Failed to load explicit MePo-21K/1K checkpoint: {checkpoint_path}"
+                ) from e
+            _logger.warning('Failed to load MEPO (21k->1k) weights from %s: %s', checkpoint_path, e)
     return model
 
 
@@ -1367,18 +1445,49 @@ def vit_base_patch16_224_mepo_ibot_21k(pretrained=False, **kwargs):
     Loads local checkpoint if pretrained=True: ./checkpoints/ibot_21k_mepo_epoch_0.pth
     """
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
+    explicit_checkpoint = 'checkpoint_path' in model_kwargs
+    checkpoint_path = model_kwargs.pop(
+        'checkpoint_path', './checkpoints/ibot_21k_mepo_epoch_0.pth')
     # Build on top of in21k variant but avoid remote downloads here
     model = _create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, **model_kwargs)
     if pretrained:
         try:
-            ckpt = torch.load('./checkpoints/ibot_21k_mepo_epoch_0.pth', map_location='cpu')
+            ckpt = torch.load(checkpoint_path, map_location='cpu')
             if isinstance(ckpt, dict) and 'state_dict' in ckpt:
                 ckpt = ckpt['state_dict']
             state_dict = model.state_dict()
             # keep only intersecting keys
             ckpt = {k: v for k, v in ckpt.items() if k in state_dict}
+            if explicit_checkpoint and not ckpt:
+                raise RuntimeError(
+                    "No iBOT-style MePo checkpoint tensors matched the backbone"
+                )
             state_dict.update(ckpt)
             model.load_state_dict(state_dict)
         except Exception as e:
-            _logger.warning('Failed to load iBOT-style MEPO (21k) weights from local checkpoint: %s', e)
+            if explicit_checkpoint:
+                raise RuntimeError(
+                    f"Failed to load explicit iBOT-style MePo checkpoint: {checkpoint_path}"
+                ) from e
+            _logger.warning(
+                'Failed to load iBOT-style MEPO (21k) weights from %s: %s',
+                checkpoint_path,
+                e,
+            )
     return model
+
+@register_model
+def vit_base_patch16_224_hfpooling(pretrained=False, **kwargs):
+    """Compatibility alias for ViT-B/16 used by older FlyPrompt commands."""
+    model_kwargs = dict(
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        **kwargs,
+    )
+    return _create_vision_transformer(
+        'vit_base_patch16_224',
+        pretrained=pretrained,
+        **model_kwargs,
+    )

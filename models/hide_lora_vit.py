@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import vit as custom_vit
+from .backbone import create_backbone
 from .experts import LoRAExpert
 
 
@@ -24,8 +24,12 @@ class HiDeLoRAModel(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.task_num = task_num
-        assert hasattr(custom_vit, backbone_name), f"Unsupported backbone {backbone_name} for HiDe-LoRA"
-        self.backbone = getattr(custom_vit, backbone_name)(pretrained=pretrained, num_classes=num_classes)
+        self.backbone = create_backbone(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=num_classes,
+            backbone_path=kwargs.get("backbone_path"),
+        )
         # freeze all ViT backbone parameters; only LoRA and heads are trainable
         for _, p in self.backbone.named_parameters():
             p.requires_grad = False
@@ -174,4 +178,3 @@ class HiDeLoRAModel(nn.Module):
         feats = torch.cat(feats, dim=0)
         labels = torch.cat(labels, dim=0)
         return feats, labels
-

@@ -1,11 +1,10 @@
 import logging
 import math
 
-import timm
 import torch
 import torch.nn as nn
 
-import models.vit as vit
+from models.backbone import create_backbone
 
 logger = logging.getLogger()
 
@@ -162,13 +161,15 @@ class SDLoRAModel(nn.Module):
         self.task_count = 0
 
         assert backbone_name is not None, "backbone_name must be specified"
-        # Use custom ViT model from models.vit to support local .npz loading
-        if hasattr(vit, backbone_name):
-            logger.info(f"Using custom ViT model: {backbone_name}")
-            self.add_module("backbone", getattr(vit, backbone_name)(pretrained=True, num_classes=num_classes))
-        else:
-            logger.info(f"Using timm model: {backbone_name}")
-            self.add_module("backbone", timm.create_model(backbone_name, pretrained=True, num_classes=num_classes))
+        self.add_module(
+            "backbone",
+            create_backbone(
+                backbone_name,
+                pretrained=True,
+                num_classes=num_classes,
+                backbone_path=kwargs.get("backbone_path"),
+            ),
+        )
 
         # Freeze backbone parameters, keep classifier head trainable
         for _, p in self.backbone.named_parameters():
@@ -231,4 +232,3 @@ class SDLoRAModel(nn.Module):
             self.task_count += 1
         logger.info(f"[SDLoRA] Switched to task {self.task_count}")
         return
-

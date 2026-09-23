@@ -1,13 +1,12 @@
 import logging
 from typing import Iterable
 
-import timm
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import models.vit as vit
+from models.backbone import create_backbone
 from models.l2p import Prompt
 from models.flyprompt import RPFC
 
@@ -75,6 +74,12 @@ class DualPrompt(nn.Module):
         self.cov_coef = float(self.kwargs.get("cov_coef", 0.7))
         self.cov_coef = max(0.0, min(1.0, self.cov_coef)) # Enforce cov_coef in [0, 1]
 
+        if kwargs.get("backbone_path") and self.mepo_backbone_path:
+            raise ValueError(
+                "backbone_path and mepo_backbone_path cannot be used together; "
+                "choose one backbone initialization source."
+            )
+
         # Require both MePo paths to be specified together, or neither
         if (self.mepo_backbone_path is None) != (self.cov_path is None):
             raise ValueError(
@@ -98,13 +103,15 @@ class DualPrompt(nn.Module):
 
         # Backbone
         assert backbone_name is not None, 'backbone_name must be specified'
-        # Use custom ViT model from models.vit to support local .npz loading
-        if hasattr(vit, backbone_name):
-            logger.info(f'Using custom ViT model: {backbone_name}')
-            self.add_module('backbone', getattr(vit, backbone_name)(pretrained=True, num_classes=num_classes))
-        else:
-            logger.info(f'Using timm model: {backbone_name}')
-            self.add_module('backbone', timm.create_model(backbone_name, pretrained=True, num_classes=num_classes))
+        self.add_module(
+            'backbone',
+            create_backbone(
+                backbone_name,
+                pretrained=True,
+                num_classes=num_classes,
+                backbone_path=kwargs.get("backbone_path"),
+            ),
+        )
 
         # Optionally override backbone weights with MePo checkpoint (without loading fc/head)
         if self.mepo_backbone_path is not None:

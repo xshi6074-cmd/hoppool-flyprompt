@@ -12,9 +12,29 @@ def base_parser():
     parser.add_argument("--note", type=str, default="", help="Short description of the exp")
     parser.add_argument("--log_path", type=str, default="results", help="The path logs are saved.")
 
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=None,
+        help=(
+            "Physical GPU ID to expose to this process. When specified, the "
+            "selected device is available inside Python as cuda:0."
+        ),
+    )
+
     # ============ Model configuration =============
     parser.add_argument("--method", type=str, default="l2p", help="Method name", choices=METHODS.keys())
     parser.add_argument("--backbone", type=str, default="vit_base_patch16_224", help="Backbone name")
+    parser.add_argument(
+        "--backbone_path",
+        type=str,
+        default=None,
+        help=(
+            "Path to a local pretrained backbone checkpoint. This initializes "
+            "the backbone only; it does not resume optimizer or training state."
+        ),
+    )
+
 
     # =========== Dataset configuration ============
     parser.add_argument("--dataset", type=str, default="cifar10", help="dataset name", choices=DATASETS.keys())

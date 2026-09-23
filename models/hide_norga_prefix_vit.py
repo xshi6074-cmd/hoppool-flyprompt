@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import vit as custom_vit
+from .backbone import create_backbone
 from .flyprompt import RPFC
 
 
@@ -19,10 +19,15 @@ class PrefixViTBackbone(nn.Module):
         num_prefix_layers: int = 5,
         use_norga: bool = False,
         pretrained: bool = True,
+        backbone_path=None,
     ) -> None:
         super().__init__()
-        assert hasattr(custom_vit, backbone_name), f"Unsupported backbone {backbone_name} for prefix ViT"
-        self.backbone = getattr(custom_vit, backbone_name)(pretrained=pretrained, num_classes=num_classes)
+        self.backbone = create_backbone(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=num_classes,
+            backbone_path=backbone_path,
+        )
         self.task_num = task_num
         self.prefix_len = prefix_len
         self.num_prefix_layers = num_prefix_layers
@@ -141,6 +146,7 @@ class HiDePrefixModel(nn.Module):
             num_prefix_layers=num_prefix_layers,
             use_norga=False,
             pretrained=pretrained,
+            backbone_path=kwargs.get("backbone_path"),
         )
         # freeze all pre-trained ViT backbone parameters; only prefixes and heads are trainable
         if hasattr(self.backbone, "backbone"):
@@ -428,6 +434,7 @@ class NoRGaPrefixModel(HiDePrefixModel):
             num_prefix_layers=num_prefix_layers,
             use_norga=True,
             pretrained=pretrained,
+            backbone_path=kwargs.get("backbone_path"),
         )
         if hasattr(self.backbone, "backbone"):
             for name, param in self.backbone.backbone.named_parameters():
@@ -435,4 +442,3 @@ class NoRGaPrefixModel(HiDePrefixModel):
 
     def freeze_act_scale(self) -> None:
         self.backbone.freeze_act_scale()
-

@@ -1,6 +1,7 @@
-from torchvision.datasets import CIFAR10, CIFAR100, Places365
+from torchvision.datasets import CIFAR10, Places365
 
 from .CARS196 import CARS196
+from .CIFAR100 import CIFAR100
 from .CUB175 import CUB175
 from .CUB200 import CUB200
 from .CUBrandom import CUBRandom

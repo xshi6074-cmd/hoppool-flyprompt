@@ -1,9 +1,9 @@
 # import torch_optimizer
 # from easydict import EasyDict as edict
-import timm
 from torch import optim
 
 from models import MODELS
+from models.backbone import create_backbone
 from optim.fam import FAM
 from optim.sam import SAM
 
@@ -88,31 +88,16 @@ def select_scheduler(sched_name, opt, hparam=None):
     return scheduler
 
 def select_model(method, backbone, num_classes=None, n_tasks=None, kwargs=None):
-    import logging
-    logger = logging.getLogger()
-
     if method=="slca":
-        import models.vit as vit
-        # Use custom ViT model from models.vit to support local .npz loading
-        if hasattr(vit, backbone):
-            logger.info(f'Using custom ViT model: {backbone}')
-            model = getattr(vit, backbone)(
-                pretrained=True,
-                num_classes=num_classes,
-                drop_rate=0.,
-                drop_path_rate=0.,
-                drop_block_rate=None
-            )
-        else:
-            logger.info(f'Using timm model: {backbone}')
-            model = timm.create_model(
-                backbone,
-                pretrained=True,
-                num_classes=num_classes,
-                drop_rate=0.,
-                drop_path_rate=0.,
-                drop_block_rate=None
-            )
+        model = create_backbone(
+            backbone,
+            pretrained=True,
+            num_classes=num_classes,
+            backbone_path=(kwargs or {}).get("backbone_path"),
+            drop_rate=0.,
+            drop_path_rate=0.,
+            drop_block_rate=None,
+        )
     elif method in MODELS.keys():
         # For most methods, task_num corresponds to the benchmark number of
         # tasks (n_tasks). For some prompt-based methods (DualPrompt, MVP,

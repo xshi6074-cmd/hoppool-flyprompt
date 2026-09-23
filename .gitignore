@@ -182,3 +182,4 @@ results
 
 /*.sh
 !run.sh
+!run_v2.sh
