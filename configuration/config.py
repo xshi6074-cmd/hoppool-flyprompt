@@ -11,7 +11,6 @@ def base_parser():
     parser.add_argument("--seeds", type=int, nargs="+", default=[1])
     parser.add_argument("--note", type=str, default="", help="Short description of the exp")
     parser.add_argument("--log_path", type=str, default="results", help="The path logs are saved.")
-
     parser.add_argument(
         "--gpu",
         type=int,
@@ -34,7 +33,6 @@ def base_parser():
             "the backbone only; it does not resume optimizer or training state."
         ),
     )
-
 
     # =========== Dataset configuration ============
     parser.add_argument("--dataset", type=str, default="cifar10", help="dataset name", choices=DATASETS.keys())
@@ -94,10 +92,16 @@ def base_parser():
     parser.add_argument("--pos_prompt", type=int, nargs="+", default=[0, 1, 2, 3, 4], help="The position of the prompt")
     parser.add_argument("--rp_dim", type=int, default=10000, help="The dimension of the random projection head")
     parser.add_argument("--rp_ridge", type=float, default=1e4, help="The ridge parameter for the random projection head")
+    parser.add_argument("--use_ema", action="store_true", default=False,
+                        help=(
+                            "Ensemble EMA classifier heads with the online FC: one bank per "
+                            "expert for flyprompt, one global bank for baseline, shared_prompt, "
+                            "hfpool and gate. Without it only the online FC is used."
+                        ))
     parser.add_argument("--ema_ratio", type=float, nargs="+", default=[0.9, 0.99], help="The EMA ratio for the expert FCs")
     parser.add_argument("--ensemble_method", type=str, default="softmax_max_prob", choices=["mean", "max_prob", "min_entropy", "softmax_mean", "softmax_max_prob", "softmax_min_entropy"],
                         help="Ensemble method for combining expert outputs: mean (average), max (maximum), min_entropy (minimum entropy), and softmax variants of these.")
-
+   
     # ========== RPFC gating configurations ==========
     parser.add_argument("--use_rp_gate", action="store_true", default=False,
                         help="Use FlyPrompt-style RPFC head for task gating in compatible methods (e.g., SPrompt, HiDe/NoRGa, DualPrompt, MVP).")
@@ -106,9 +110,44 @@ def base_parser():
     parser.add_argument("--use_ema_head", action="store_true", default=False,
                         help="Use EMA-based classifier head bank and ensemble in compatible methods (e.g., SPrompt, HiDe/NoRGa, DualPrompt, MVP).")
 
-    # ======== Expert similarity analysis ==========
+    
     parser.add_argument("--analysis_expert_similarity", action="store_true", default=False,
                         help="If set, run expert feature similarity / CKA (including residual vs common) analysis after training.")
+
+    # ========== HFPool configurations ==========
+    parser.add_argument("--num_pooling_heads", type=int, default=1,
+                        help="Attention heads per Hopfield pooling layer.")
+    parser.add_argument("--num_pooling_blocks", type=int, default=5,
+                        help="Number of consecutive ViT blocks that receive Hopfield prompts.")
+    parser.add_argument("--prompt_length", type=int, default=10,
+                        help="Prompt tokens pooled per Hopfield layer.")
+    parser.add_argument("--deep_prompts", type=int, default=0,
+                        help="1 places the pooling blocks at the deepest layers instead of the "
+                             "shallowest; ignored when --hopfield_start_layer is set.")
+    parser.add_argument("--hopfield_start_layer", type=int, default=None,
+                        help="Zero-based first ViT block that receives a Hopfield prompt.")
+    parser.add_argument("--hopfield_input_mode", choices=["local", "full_vit"], default="local",
+                        help=(
+                            "local pools from the tokens entering each prompted block; full_vit "
+                            "(ablation) pools every layer from one detached clean full-ViT token "
+                            "sequence and requires --online_iter 3."
+                        ))
+    parser.add_argument("--hopfield_trainable", nargs="+", choices=["query", "q", "k", "v", "o"],
+                        default=["q"],
+                        help=(
+                            "Hopfield parts that receive gradients: query (pooling weights), "
+                            "q/k/v (packed input projection slices), o (output projection). "
+                            "V is a static identity unless v is listed, in which case an "
+                            "identity-initialised projection is trained. Normalisation stays frozen."
+                        ))
+    parser.add_argument("--hopfield_grad_clip", action="store_true",
+                        help="Clip trainable Hopfield gradients after AMP unscaling (stabilises joint training).")
+    parser.add_argument("--hopfield_grad_clip_norm", type=float, default=1.0,
+                        help="Maximum Hopfield gradient norm used with --hopfield_grad_clip.")
+
+    # ========== Gate configurations ==========
+    parser.add_argument("--gate_blocks", type=int, nargs="+", default=[0, 1, 2, 3, 4],
+                        help="ViT blocks whose attention heads get a learned 1 + tanh(alpha) gain.")
 
     args = parser.parse_args()
     return args

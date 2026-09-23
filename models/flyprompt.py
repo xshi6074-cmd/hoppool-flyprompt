@@ -1,12 +1,12 @@
 import logging
 from typing import Iterable
 
-import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import models.vit as vit
+from models.backbone import create_backbone
+
 
 logger = logging.getLogger()
 
@@ -42,7 +42,7 @@ class Prompt(nn.Module):
         pos_bias = backbone.pos_embed[:, :1, :].unsqueeze(1).expand(B, self.num_layers, self.len_prompt, D)
         prompts = prompts + pos_bias
         return prompts
-
+        
     def forward(self, backbone: nn.Module, inputs: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
         x = backbone.patch_embed(inputs)
         B, N, D = x.size()
@@ -135,6 +135,8 @@ class RPFC(nn.Module):
 
 
 class FlyPrompt(nn.Module):
+    """Task-wise prompt experts routed by REAR (RPFC), with optional EMA heads."""
+
     def __init__(self,
                  task_num       : int   = 10,
                  num_classes    : int   = 100,
@@ -144,56 +146,65 @@ class FlyPrompt(nn.Module):
                  rp_dim         : int   = 10000,
                  rp_ridge       : float = 1e4,
                  ema_ratio      : Iterable[float] = (0.9, 0.99),
+                 use_ema        : bool  = False,
                  **kwargs):
 
         super().__init__()
 
-        self.kwargs = kwargs
         self.task_num = task_num
         self.num_classes = num_classes
         self.len_prompt = len_prompt
         self.pos_prompt = pos_prompt
         self.rp_dim = rp_dim
         self.rp_ridge = rp_ridge
-        self.ema_ratio = ema_ratio
-        self.num_ema = len(ema_ratio)
+        self.ema_ratio = [float(ratio) for ratio in ema_ratio]
+        self.use_ema = bool(use_ema)
+        self.num_ema = len(self.ema_ratio) if self.use_ema else 0
 
         self.task_count = 0
 
         # Backbone
         assert backbone_name is not None, 'backbone_name must be specified'
-        # Use custom ViT model from models.vit to support local .npz loading
-        if hasattr(vit, backbone_name):
-            logger.info(f'Using custom ViT model: {backbone_name}')
-            self.add_module('backbone', getattr(vit, backbone_name)(pretrained=True, num_classes=num_classes))
-        else:
-            logger.info(f'Using timm model: {backbone_name}')
-            self.add_module('backbone', timm.create_model(backbone_name, pretrained=True, num_classes=num_classes))
+        self.add_module(
+            'backbone',
+            create_backbone(
+                backbone_name,
+                num_classes=num_classes,
+                pretrained=kwargs.get("pretrained", True),
+                backbone_path=kwargs.get("backbone_path"),
+            ),
+        )
         self.embed_dim = self.backbone.num_features
-        for name, param in self.backbone.named_parameters():
+        for param in self.backbone.parameters():
             param.requires_grad = False
         self.backbone.fc.weight.requires_grad = True
-        self.backbone.fc.bias.requires_grad   = True
+        self.backbone.fc.bias.requires_grad = True
 
         # Expert prompts
         self.experts = Prompt(
-            num_experts = self.task_num,
-            len_prompt = self.len_prompt,
-            embed_dim = self.embed_dim,
-            pos_prompt = self.pos_prompt,
+            num_experts=self.task_num,
+            len_prompt=self.len_prompt,
+            embed_dim=self.embed_dim,
+            pos_prompt=self.pos_prompt,
         )
 
         # Expert FCs
-        self.experts_fc = nn.ModuleList([
-            nn.ModuleList([
-                nn.Linear(self.embed_dim, self.num_classes, bias=True) for _ in range(self.num_ema)
-            ]) for _ in range(self.task_num)
-        ])
-        for expert_fc in self.experts_fc:
-            for fc in expert_fc:
-                for param in fc.parameters():
-                    param.requires_grad = False
-        self.init_fc(expert_id = 0)
+        self.experts_fc = None
+        if self.use_ema:
+            if not self.ema_ratio:
+                raise ValueError("ema_ratio must not be empty when use_ema=True")
+            self.experts_fc = nn.ModuleList([
+                nn.ModuleList([
+                    nn.Linear(self.embed_dim, self.num_classes, bias=True)
+                    for _ in range(self.num_ema)
+                ])
+                for _ in range(self.task_num)
+            ])
+            for expert_fc in self.experts_fc:
+                for fc in expert_fc:
+                    for param in fc.parameters():
+                        param.requires_grad = False
+            self.init_fc(expert_id=0)
 
         # Random projection head
         self.rp_head = RPFC(
@@ -203,38 +214,35 @@ class FlyPrompt(nn.Module):
             num_classes = self.task_num,
         )
 
-    def forward(self, inputs: torch.Tensor, expert_ids: torch.Tensor = None, **kwargs) -> torch.Tensor:
+    def _resolve_expert_ids(self, inputs: torch.Tensor, expert_ids: torch.Tensor = None) -> torch.Tensor:
         if expert_ids is None:
-            expert_ids = torch.full((inputs.size(0),), self.task_count, device=inputs.device, dtype=torch.long)
+            return torch.full((inputs.size(0),), self.task_count, device=inputs.device, dtype=torch.long)
+        return expert_ids
+
+    def forward(self, inputs: torch.Tensor, expert_ids: torch.Tensor = None, **kwargs) -> torch.Tensor:
+        expert_ids = self._resolve_expert_ids(inputs, expert_ids)
         x = self.experts(self.backbone, inputs, expert_ids)
-        x = self.backbone.fc(x)
-        return x
-    
+        return self.backbone.fc(x)
+
     def forward_with_rp(self, inputs: torch.Tensor, **kwargs) -> torch.Tensor:
         x = self.backbone.forward_features(inputs)
         x = x[:, 0]
-        x = self.rp_head(x)
-        return x
-    
-    def forward_with_ema(self, inputs: torch.Tensor, expert_ids: torch.Tensor = None, **kwargs) -> torch.Tensor:
-        if expert_ids is None:
-            expert_ids = torch.full((inputs.size(0),), self.task_count, device=inputs.device, dtype=torch.long)
-        x = self.experts(self.backbone, inputs, expert_ids)
-        outputs_ls = []
+        return self.rp_head(x)
 
-        # online head
-        outputs_ls.append(self.backbone.fc(x))
-        
-        # ema head
+    def forward_with_ema(self, inputs: torch.Tensor, expert_ids: torch.Tensor = None, **kwargs):
+        expert_ids = self._resolve_expert_ids(inputs, expert_ids)
+        x = self.experts(self.backbone, inputs, expert_ids)
+        outputs_ls = [self.backbone.fc(x)]
+        if not self.use_ema:
+            return outputs_ls
+
         for i in range(self.num_ema):
             outputs = []
             for x_i, e_i in zip(x, expert_ids):
                 outputs.append(self.experts_fc[e_i.item()][i](x_i))
-            outputs = torch.stack(outputs, dim=0)
-            outputs_ls.append(outputs)
-
+            outputs_ls.append(torch.stack(outputs, dim=0))
         return outputs_ls
-    
+
     def collect(self, inputs: torch.Tensor, labels: torch.Tensor):
         features = self.backbone.forward_features(inputs)
         features = features[:, 0]
@@ -246,6 +254,8 @@ class FlyPrompt(nn.Module):
 
     @torch.no_grad()
     def init_fc(self, expert_id: int = None):
+        if not self.use_ema:
+            return
         if expert_id is None:
             expert_id = self.task_count
         if expert_id >= self.task_num:
@@ -257,6 +267,8 @@ class FlyPrompt(nn.Module):
 
     @torch.no_grad()
     def update_ema_fc(self, expert_id: int = None):
+        if not self.use_ema:
+            return
         if expert_id is None:
             expert_id = self.task_count
         for i in range(self.num_ema):

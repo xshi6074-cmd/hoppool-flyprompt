@@ -8,13 +8,48 @@ from optim.fam import FAM
 from optim.sam import SAM
 
 
+# Methods whose model state advances on internal sample-count steps
+# (``--step_num``) instead of benchmark task ids.
+STEP_AWARE_METHODS = frozenset({
+    "dualprompt", "mvp", "flyprompt",
+    "baseline", "shared_prompt", "hfpool", "gate",
+})
+
+
 def cycle(iterable):
     # iterate with shuffling
     while True:
         for i in iterable:
             yield i
 
+
+def _split_hopfield_slice_masked(parameters):
+    regular_params = []
+    slice_masked_params = []
+    for param in parameters:
+        if not param.requires_grad:
+            continue
+        if getattr(param, "_hopfield_slice_masked", False):
+            slice_masked_params.append(param)
+        else:
+            regular_params.append(param)
+    return regular_params, slice_masked_params
+
+
+def _sgd_parameter_groups(parameters, weight_decay):
+    regular_params, slice_masked_params = _split_hopfield_slice_masked(
+        parameters
+    )
+    groups = [{"params": regular_params, "weight_decay": weight_decay}]
+    if slice_masked_params:
+        groups.append({"params": slice_masked_params, "weight_decay": 0.0})
+    return groups
+
+
 def select_optimizer(opt_name, lr, model):
+
+    for name, param in model.named_parameters():
+        print(name, param.requires_grad)
 
     if opt_name == "adam":
         opt = optim.Adam(model.parameters(), lr=lr, weight_decay=0)
@@ -38,7 +73,10 @@ def select_optimizer(opt_name, lr, model):
                     ], weight_decay=0)
     elif opt_name == "sgd":
         opt = optim.SGD(
-            model.parameters(), lr=lr, momentum=0.9, nesterov=True, weight_decay=1e-4
+            _sgd_parameter_groups(model.parameters(), weight_decay=1e-4),
+            lr=lr,
+            momentum=0.9,
+            nesterov=True,
         )
     elif opt_name == 'sgd_sl':
         fc_params = []
@@ -54,10 +92,20 @@ def select_optimizer(opt_name, lr, model):
                 else:  # All other layers
                     other_params.append(param)
                     other_params_name.append(name)
-        opt = optim.SGD([
-                        {'params': other_params, 'lr': lr},       # Learning rate lr1 for fully-connected layers
-                        {'params': fc_params, 'lr': 0.005}     # Learning rate lr2 for all other layers
-                    ], weight_decay=5e-4)
+        other_params, slice_masked_params = _split_hopfield_slice_masked(
+            other_params
+        )
+        parameter_groups = [
+            {'params': other_params, 'lr': lr, 'weight_decay': 5e-4},
+            {'params': fc_params, 'lr': 0.005, 'weight_decay': 5e-4},
+        ]
+        if slice_masked_params:
+            parameter_groups.append({
+                'params': slice_masked_params,
+                'lr': lr,
+                'weight_decay': 0.0,
+            })
+        opt = optim.SGD(parameter_groups)
     elif opt_name == "sam":
         base_optimizer = optim.Adam
         opt = SAM(model.parameters(), base_optimizer, lr=lr, weight_decay=0)
@@ -104,7 +152,7 @@ def select_model(method, backbone, num_classes=None, n_tasks=None, kwargs=None):
         # FlyPrompt), we instead interpret task_num as the number of internal
         # steps, which can be overridden by ``step_num`` if provided.
         task_num_for_model = n_tasks
-        if kwargs is not None and method in ("dualprompt", "mvp", "flyprompt"):
+        if kwargs is not None and method in STEP_AWARE_METHODS:
             step_num = kwargs.get("step_num", None)
             if step_num is not None and step_num > 0:
                 task_num_for_model = step_num

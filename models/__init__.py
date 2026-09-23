@@ -1,6 +1,10 @@
 from .codaprompt import CodaPrompt
 from .dualprompt import DualPrompt
 from .flyprompt import FlyPrompt
+from .frozen_vit import Baseline
+from .gate import Gate
+from .hfpool import HFPool
+from .shared_prompt import SharedPrompt
 from .l2p import L2P
 from .mvp import MVP
 from .ranpac import RanPAC
@@ -14,6 +18,10 @@ MODELS = {
     "codaprompt": CodaPrompt,
     "dualprompt": DualPrompt,
     "flyprompt": FlyPrompt,
+    "baseline": Baseline,
+    "shared_prompt": SharedPrompt,
+    "gate": Gate,
+    "hfpool": HFPool,
     "l2p": L2P,
     "mvp": MVP,
     "ranpac": RanPAC,

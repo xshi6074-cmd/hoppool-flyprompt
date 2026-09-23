@@ -1,6 +1,8 @@
 from .codaprompt import CodaPrompt
 from .dualprompt import DualPrompt
 from .flyprompt import FlyPrompt
+from .frozen_vit import FrozenViTTrainer
+from .hfpool import HFPool
 from .l2p import L2P
 from .mvp import MVP
 from .ranpac import RanPAC
@@ -13,6 +15,10 @@ METHODS = {
     "codaprompt": CodaPrompt,
     "dualprompt": DualPrompt,
     "flyprompt": FlyPrompt,
+    "baseline": FrozenViTTrainer,
+    "shared_prompt": FrozenViTTrainer,
+    "gate": FrozenViTTrainer,
+    "hfpool": HFPool,
     "l2p": L2P,
     "mvp": MVP,
     "ranpac": RanPAC,

@@ -20,7 +20,7 @@ from datasets import *
 from utils.augment import Cutout
 from utils.data_loader import get_statistics
 from utils.onlinesampler import OnlineSampler, OnlineTestSampler
-from utils.train_utils import select_model, select_optimizer, select_scheduler
+from utils.train_utils import STEP_AWARE_METHODS, select_model, select_optimizer, select_scheduler
 
 logger = logging.getLogger()
 mp.set_sharing_strategy('file_system')
@@ -37,8 +37,7 @@ class _Trainer():
 
         # Internal step-based schedule (task-boundary-free) for selected methods.
         method_name = getattr(self, "method", None)
-        step_aware_methods = {"dualprompt", "mvp", "flyprompt"}
-        if method_name in step_aware_methods:
+        if method_name in STEP_AWARE_METHODS:
             # step_num > 1; if not provided or <=0, default to n_tasks.
             self.step_num = getattr(self, "step_num", None)
             if self.step_num is None or self.step_num <= 0:
