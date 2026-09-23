@@ -4,6 +4,7 @@ from .flyprompt import FlyPrompt
 from .frozen_vit import Baseline
 from .gate import Gate
 from .hfpool import HFPool
+from .mlp_generator import MLPGenerator
 from .shared_prompt import SharedPrompt
 from .l2p import L2P
 from .mvp import MVP
@@ -22,6 +23,7 @@ MODELS = {
     "shared_prompt": SharedPrompt,
     "gate": Gate,
     "hfpool": HFPool,
+    "mlp_generator": MLPGenerator,
     "l2p": L2P,
     "mvp": MVP,
     "ranpac": RanPAC,

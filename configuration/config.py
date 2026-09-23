@@ -114,6 +114,126 @@ def base_parser():
     parser.add_argument("--analysis_expert_similarity", action="store_true", default=False,
                         help="If set, run expert feature similarity / CKA (including residual vs common) analysis after training.")
 
+    # ========== MLP generator configurations ==========
+    parser.add_argument("--prompt_blocks", type=int, nargs="+", default=[0],
+                        help="Strictly increasing ViT block indices that receive generated prompts.")
+    parser.add_argument("--generator_layers", type=int, choices=[1, 2, 3], default=1,
+                        help="Number of Linear layers in the clean-CLS prompt generator.")
+    parser.add_argument("--generator_hidden_dim", type=int, default=None,
+                        help="Hidden width for 2/3-layer generators; defaults to the backbone embedding width.")
+    parser.add_argument("--distill_weight", type=float, default=1.0,
+                        help=(
+                            "Weight of old-class prompt functional distillation. "
+                            "0 disables the teacher branch entirely (no anchor "
+                            "sampling, no teacher forward): the no-distillation "
+                            "control in fixed mode. In uncertainty mode this is "
+                            "the initial value."
+                        ))
+    parser.add_argument("--distill_weight_mode",
+                        choices=["fixed", "uncertainty", "gradnorm"],
+                        default="fixed",
+                        help=(
+                            "How the distillation coefficient is chosen. fixed "
+                            "uses --distill_weight; uncertainty keeps the legacy "
+                            "exp(-s)*D+s objective; gradnorm uses a detached "
+                            "one-sided gradient-ratio controller."
+                        ))
+    parser.add_argument("--learnable_distill_weight", action="store_true",
+                        help=(
+                            "Legacy alias for --distill_weight_mode uncertainty. "
+                            "It conflicts with --distill_weight_mode gradnorm."
+                        ))
+    parser.add_argument("--distill_delay_samples", type=int, default=100,
+                        help=(
+                            "After every hard-teacher snapshot, skip the entire "
+                            "distillation branch until at least this many global "
+                            "stream samples have completed. Whole batches are not "
+                            "split."
+                        ))
+    parser.add_argument("--distill_grad_ratio", type=float, default=0.25,
+                        help=(
+                            "GradNorm-lite target ||w grad D|| / ||grad CE|| on "
+                            "the generator reference layer."
+                        ))
+    parser.add_argument("--distill_grad_ema", type=float, default=0.9,
+                        help="EMA coefficient applied to log GradNorm weights.")
+    parser.add_argument("--distill_weight_min", type=float, default=1e-4,
+                        help="Lower bound for the GradNorm-lite target weight.")
+    parser.add_argument("--distill_weight_max", type=float, default=1e4,
+                        help="Upper bound for the GradNorm-lite target weight.")
+    parser.add_argument("--distill_metric", choices=["mse", "cosine"], default="mse",
+                        help="Distance between student and hard-teacher generated prompts.")
+    parser.add_argument("--statistic_type", choices=["diagonal", "low_rank"], default="diagonal",
+                        help="Class-conditional clean-CLS replay distribution.")
+    parser.add_argument("--covariance_rank", type=int, default=16,
+                        help="Rank of the correlated M2 sketch when statistic_type=low_rank.")
+    parser.add_argument("--sketch_shrinkage", choices=["none", "fd"], default="none",
+                        help=(
+                            "How the low-rank sketch is compressed after each "
+                            "merge. 'none' keeps the plain top-r truncation, "
+                            "which is per-step optimal but lets the sketch "
+                            "freeze on whichever directions were dominant "
+                            "first. 'fd' subtracts the first discarded "
+                            "eigenvalue (Frequent Directions), which unfreezes "
+                            "new directions but strongly deflates the sketch "
+                            "when the spectrum is flat relative to "
+                            "--covariance_rank. Measure the spectrum before "
+                            "choosing 'fd'."
+                        ))
+    parser.add_argument("--replay_class_budget", type=int, default=8,
+                        help="Total old classes replayed per optimizer step across all active teachers.")
+    parser.add_argument("--anchors_per_class", type=int, default=1,
+                        help=(
+                            "Anchors drawn per selected replay class. With 1 the "
+                            "distillation loss is a rank-1 Monte-Carlo estimate of "
+                            "the anchor second moment, so no covariance model can "
+                            "be distinguished from a diagonal one. Use >= 8 when "
+                            "ablating --statistic_type."
+                        ))
+    parser.add_argument("--replay_eligibility", choices=["teacher", "previous"],
+                        default="previous",
+                        help=(
+                            "Which snapshot decides the replay-eligible classes. "
+                            "'previous' (default) uses the snapshot one internal "
+                            "step older than the teacher, so classes introduced "
+                            "while the teacher itself was still learning them are "
+                            "not replayed. 'teacher' uses the teacher's own "
+                            "snapshot, which is the older behaviour and lets a "
+                            "class under active training into the replay pool."
+                        ))
+    parser.add_argument("--distill_mode", choices=["sample", "closed_form"],
+                        default="sample",
+                        help=(
+                            "How the teacher-student prompt discrepancy is "
+                            "measured. 'sample' draws anchors from the stored "
+                            "class distribution. 'closed_form' evaluates the "
+                            "exact population MSE of the affine student-teacher "
+                            "difference over that distribution, with no anchor "
+                            "sampling and no estimator noise; it requires "
+                            "--generator_layers 1 and --distill_metric mse, and "
+                            "forces --statistics_space normalized."
+                        ))
+    parser.add_argument("--statistics_space", choices=["raw", "normalized"],
+                        default="raw",
+                        help=(
+                            "Space in which clean-CLS class statistics are "
+                            "collected. 'normalized' applies the generator's "
+                            "parameter-free LayerNorm normalisation first, which "
+                            "removes the shared mean direction that otherwise "
+                            "dominates the second moment. Required by "
+                            "--distill_mode closed_form."
+                        ))
+    parser.add_argument("--min_replay_samples", type=int, default=2,
+                        help="Minimum class count at snapshot time before that class is replay-eligible.")
+    parser.add_argument("--variance_prior_strength", type=float, default=16.0,
+                        help="Count-based shrinkage strength toward pooled within-class diagonal variance.")
+    parser.add_argument("--variance_floor", type=float, default=1e-5,
+                        help="Minimum replay variance per clean-CLS dimension.")
+    parser.add_argument("--variance_ceiling", type=float, default=10.0,
+                        help="Maximum replay variance per clean-CLS dimension.")
+    parser.add_argument("--teacher_lags", type=int, nargs="+", default=[1],
+                        help="Hard-teacher snapshot lags measured in internal steps, e.g. 1 5.")
+
     # ========== HFPool configurations ==========
     parser.add_argument("--num_pooling_heads", type=int, default=1,
                         help="Attention heads per Hopfield pooling layer.")

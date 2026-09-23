@@ -11,7 +11,7 @@ from optim.sam import SAM
 # Methods whose model state advances on internal sample-count steps
 # (``--step_num``) instead of benchmark task ids.
 STEP_AWARE_METHODS = frozenset({
-    "dualprompt", "mvp", "flyprompt",
+    "dualprompt", "mvp", "flyprompt", "mlp_generator",
     "baseline", "shared_prompt", "hfpool", "gate",
 })
 
