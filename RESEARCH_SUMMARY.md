@@ -100,19 +100,19 @@ CIFAR-100 上最高的 MLP 配置为 distill-off；CUB-200 上最高的是 sampl
 
 | 方法 | 配置 | (A_{auc}) |
 | --- | --- | ---: |
-| ViT + FC baseline | frozen ViT + shared online FC + batch-masked CE | **0.834933 ± 0.012228** |
 | HFPool | 仅训练 (W_o)；5 blocks；1 head；L=10；early | 0.830676 ± 0.011843 |
 | Per-head gate | ViT blocks 0–4；head-wise gain | 0.797749 ± 0.015777 |
 | MLP Generator | distill-off | 0.776301 ± 0.016731 |
+| ViT + FC baseline | frozen ViT + shared online FC + batch-masked CE | 0.722502 ± 0.024767 |
 
 ### CUB-200
 
 | 方法 | 配置 | (A_{auc}) |
 | --- | --- | ---: |
-| ViT + FC baseline | frozen ViT + shared online FC + batch-masked CE | **0.707734 ± 0.016038** |
 | HFPool | 仅训练 (W_o)；5 blocks；1 head；L=10；early | 0.701196 ± 0.018786 |
 | Per-head gate | ViT blocks 0–4；head-wise gain | 0.694427 ± 0.020673 |
 | MLP Generator | GradNorm；sampled anchors；diagonal statistics；raw MSE | 0.684627 ± 0.023622 |
+| ViT + FC baseline | frozen ViT + shared online FC + batch-masked CE | 0.648800 ± 0.028007 |
 
 ## 4 实验记录
 
