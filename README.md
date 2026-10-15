@@ -4,7 +4,7 @@
 
 预训练模型已经具备尚可的基础表示能力，但是数据持续变化，模型仍需要学习。能否只更新少量参数，让模型学会新的判别方式，同时保留过去学到的能力？本项目以冻结的pretrained ViT为基础，围绕两件事展开：**用少量参数的 meta part 根据当前输入生成调制模型的 prompt，以及用压缩的历史特征分布约束后续更新。**
 
-（**项目基于 [FlyGCL](https://github.com/AnAppleCore/FlyGCL) 开展方法扩展与分析**。本文保留研究设计和定性观察，展示相对baseline的相对进展和工作对比，不展示绝对 benchmark 数值或结果曲线）
+（**项目基于 [FlyGCL](https://github.com/AnAppleCore/FlyGCL) 开展方法扩展与分析**。本文保留研究设计和定性观察，展示相对baseline的相对进展和工作对比，不展示绝对 benchmark 数值）
 
 ## Part I · Generative online learning：高效参数学习
 
