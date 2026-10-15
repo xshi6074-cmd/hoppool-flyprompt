@@ -12,7 +12,7 @@ from optim.sam import SAM
 # (``--step_num``) instead of benchmark task ids.
 STEP_AWARE_METHODS = frozenset({
     "dualprompt", "mvp", "flyprompt", "mlp_generator",
-    "baseline", "shared_prompt", "hfpool", "gate",
+    "baseline", "shared_prompt", "hfpool", "hfpool_lora", "spatial_gelu", "gate",
 })
 
 

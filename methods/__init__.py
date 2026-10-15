@@ -3,6 +3,8 @@ from .dualprompt import DualPrompt
 from .flyprompt import FlyPrompt
 from .frozen_vit import FrozenViTTrainer
 from .hfpool import HFPool
+from .hfpool_lora import HFPoolLoRA
+from .spatial_gelu import SpatialGELU
 from .mlp_generator import MLPGenerator
 from .l2p import L2P
 from .mvp import MVP
@@ -20,6 +22,8 @@ METHODS = {
     "shared_prompt": FrozenViTTrainer,
     "gate": FrozenViTTrainer,
     "hfpool": HFPool,
+    "hfpool_lora": HFPoolLoRA,
+    "spatial_gelu": SpatialGELU,
     "mlp_generator": MLPGenerator,
     "l2p": L2P,
     "mvp": MVP,

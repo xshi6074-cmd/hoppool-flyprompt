@@ -3,19 +3,26 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.nn.utils import parametrize
 from hflayers import HopfieldPooling
 
 from models.frozen_vit import FrozenViTClassifier
+from models.prompt_pooling import LoRAOutputWeight, SpatialGELUPooling
 
 
 logger = logging.getLogger()
 
 TRAINABLE_PARTS = ("query", "q", "k", "v", "o")
 INPUT_MODES = ("local", "full_vit")
+OUTPUT_MODES = ("full", "lora", "lora_merge_1024", "lora_merge_batch")
+
+
+
+
 
 
 class HopfieldPoolingPrompts(nn.Module):
-    """Hopfield pooling layers that write prompts into consecutive ViT blocks.
+    """Hopfield pooling layers that write prompts into ViT blocks.
 
     Each layer pools ``prompt_length`` tokens, which are inserted after CLS for
     one block and removed afterwards. ``trainable`` selects the parts that
@@ -27,6 +34,8 @@ class HopfieldPoolingPrompts(nn.Module):
     ``input_mode='local'`` pools from the tokens entering each prompted block.
     ``input_mode='full_vit'`` pools every layer from one detached, normalised
     clean ViT token sequence.
+    Explicit ``prompt_blocks`` uses one module: generate at ``start_layer``
+    once per forward, then reuse that tensor at every selected insertion block.
     """
 
     def __init__(self,
@@ -36,8 +45,14 @@ class HopfieldPoolingPrompts(nn.Module):
                  prompt_length: int = 10,
                  deep_prompts: bool = False,
                  start_layer: Optional[int] = None,
+                 prompt_blocks: Optional[Iterable[int]] = None,
+                 replace_cls: bool = False,
                  input_mode: str = "local",
-                 trainable: Iterable[str] = ("q",)):
+                 pooling_mode: str = "attention",
+                 trainable: Iterable[str] = ("q",),
+                 o_mode: str = "full",
+                 lora_rank: int = 8,
+                 lora_alpha: float = 8.0):
         super().__init__()
 
         trainable = tuple(dict.fromkeys(trainable))
@@ -63,6 +78,12 @@ class HopfieldPoolingPrompts(nn.Module):
             raise ValueError(
                 f"input_mode must be one of {INPUT_MODES}, got {input_mode!r}"
             )
+        if o_mode not in OUTPUT_MODES:
+            raise ValueError(f"o_mode must be one of {OUTPUT_MODES}, got {o_mode!r}")
+        if o_mode != "full" and set(trainable) != {"o"}:
+            raise ValueError("HFPool LoRA modes require --hopfield_trainable o only")
+        if lora_rank <= 0 or lora_alpha <= 0:
+            raise ValueError("LoRA rank and alpha must be positive")
 
         self.embed_dim = int(embed_dim)
         self.num_pooling_heads = int(num_pooling_heads)
@@ -70,11 +91,30 @@ class HopfieldPoolingPrompts(nn.Module):
         self.prompt_length = int(prompt_length)
         self.deep_prompts = bool(deep_prompts)
         self.start_layer = start_layer
+        self.prompt_blocks = None if prompt_blocks is None else tuple(int(i) for i in prompt_blocks)
+        self.replace_cls = bool(replace_cls)
+        if self.replace_cls and (self.num_pooling_blocks != 1 or self.prompt_length != 1
+                                 or self.prompt_blocks is not None):
+            raise ValueError("CLS replacement requires one HFPool block, one prompt token, and no explicit prompt blocks")
+        if self.prompt_blocks is not None:
+            if num_pooling_blocks != 1:
+                raise ValueError("Explicit hopfield_prompt_blocks requires num_pooling_blocks=1")
+            if not self.prompt_blocks or tuple(sorted(set(self.prompt_blocks))) != self.prompt_blocks:
+                raise ValueError("hopfield_prompt_blocks must be non-empty and strictly increasing")
         self.input_mode = input_mode
         self.trainable = frozenset(trainable)
+        self.o_mode = o_mode
+        self.lora_rank = int(lora_rank)
+        self.lora_alpha = float(lora_alpha)
+        self.pooling_mode = pooling_mode
+        if pooling_mode not in {"attention", "spatial_gelu"}:
+            raise ValueError("Unknown pooling mode")
+        if pooling_mode == "spatial_gelu" and (self.trainable != {"o"} or prompt_length != 10
+                                                or num_pooling_heads != 1 or replace_cls):
+            raise ValueError("Spatial GELU requires 10 tokens, one head, trainable o, and ordinary prompts")
 
         self.hopfield_pooling_layers = nn.ModuleList([
-            HopfieldPooling(
+            SpatialGELUPooling(self.embed_dim) if pooling_mode == "spatial_gelu" else HopfieldPooling(
                 input_size=self.embed_dim,
                 hidden_size=self.embed_dim,
                 update_steps_max=0,
@@ -89,14 +129,51 @@ class HopfieldPoolingPrompts(nn.Module):
         if "v" in self.trainable:
             self._init_value_projection_to_identity()
         self._configure_trainable_parameters()
+        if self.o_mode != "full":
+            self._configure_lora_output_weights()
 
         logger.info(
             "HFPool | trainable=%s | input_mode=%s | start_layer=%s | "
-            "deep_prompts=%s | blocks=%d | heads=%d | prompt_length=%d",
+            "deep_prompts=%s | blocks=%d | heads=%d | prompt_length=%d | o_mode=%s | insertion_blocks=%s | replace_cls=%s | pooling_mode=%s",
             sorted(self.trainable), self.input_mode, self.start_layer,
             self.deep_prompts, self.num_pooling_blocks,
-            self.num_pooling_heads, self.prompt_length,
+            self.num_pooling_heads, self.prompt_length, self.o_mode, self.prompt_blocks,
+            self.replace_cls, self.pooling_mode,
         )
+
+    def output_projections(self):
+        return [layer.out_proj if self.pooling_mode == "spatial_gelu" else
+                layer.hopfield.association_core.out_proj for layer in self.hopfield_pooling_layers]
+
+    def _configure_lora_output_weights(self) -> None:
+        for layer_index, out_proj in enumerate(self.output_projections()):
+            if out_proj is None or out_proj.weight.ndim != 2:
+                raise ValueError("HFPool LoRA requires a two-dimensional out_proj.weight")
+            out_features, in_features = out_proj.weight.shape
+            parametrization = LoRAOutputWeight(
+                out_features, in_features, self.lora_rank,
+                self.lora_alpha, layer_index,
+            )
+            parametrize.register_parametrization(out_proj, "weight", parametrization)
+            out_proj.parametrizations.weight.original.requires_grad_(False)
+            if out_proj.bias is not None:
+                out_proj.bias.requires_grad_(False)
+
+    def lora_output_weights(self):
+        if self.o_mode == "full":
+            return []
+        return [
+            projection.parametrizations.weight[0]
+            for projection in self.output_projections()
+        ]
+
+    @torch.no_grad()
+    def merge_lora_output_weights(self):
+        results = []
+        for projection, lora in zip(self.output_projections(), self.lora_output_weights()):
+            base = projection.parametrizations.weight.original
+            results.append(lora.merge_into(base))
+        return results
 
     @staticmethod
     def _projection_slices(association_core) -> dict:
@@ -132,6 +209,12 @@ class HopfieldPoolingPrompts(nn.Module):
     def _configure_trainable_parameters(self) -> None:
         for param in self.parameters():
             param.requires_grad = False
+
+        if self.pooling_mode == "spatial_gelu":
+            for projection in self.output_projections():
+                for parameter in projection.parameters():
+                    parameter.requires_grad = True
+            return
 
         projections = tuple(name for name in ("q", "k", "v") if name in self.trainable)
         for layer in self.hopfield_pooling_layers:
@@ -185,6 +268,17 @@ class HopfieldPoolingPrompts(nn.Module):
             )
         return first, last
 
+    def resolve_prompt_blocks(self, depth: int) -> Tuple[int, ...]:
+        first, last = self._resolve_prompt_range(depth)
+        if self.prompt_blocks is None:
+            return tuple(range(first, last))
+        if self.prompt_blocks[0] < first or self.prompt_blocks[-1] >= depth:
+            raise ValueError(
+                "hopfield_prompt_blocks must be inside the backbone and at or after "
+                f"the generation block: blocks={self.prompt_blocks}, source={first}, depth={depth}"
+            )
+        return self.prompt_blocks
+
     @staticmethod
     def _embed_inputs(backbone: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
         x = backbone.patch_embed(inputs)
@@ -199,7 +293,7 @@ class HopfieldPoolingPrompts(nn.Module):
             inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run one clean ViT pass for ``input_mode='full_vit'``.
 
-        Returns the clean tokens entering the first prompted block and the
+        Returns the clean tokens entering the generation block and the
         normalised final token sequence every pooling layer reads from.
         """
         first, _ = self._resolve_prompt_range(len(backbone.blocks))
@@ -216,6 +310,7 @@ class HopfieldPoolingPrompts(nn.Module):
             backbone: nn.Module,
             inputs: torch.Tensor,
             hopfield_context: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            return_prompts: bool = False,
     ) -> torch.Tensor:
         if backbone.cls_token is None:
             raise ValueError("HFPool requires a CLS-token backbone")
@@ -226,7 +321,8 @@ class HopfieldPoolingPrompts(nn.Module):
             )
 
         depth = len(backbone.blocks)
-        first, last = self._resolve_prompt_range(depth)
+        first, _ = self._resolve_prompt_range(depth)
+        prompt_blocks = self.resolve_prompt_blocks(depth)
         if self.input_mode == "full_vit":
             if hopfield_context is None:
                 hopfield_context = self.prepare_full_vit_context(backbone, inputs)
@@ -245,18 +341,47 @@ class HopfieldPoolingPrompts(nn.Module):
             pooling_source = None
 
         batch_size = x.shape[0]
-        for layer_idx, block_idx in enumerate(range(first, last)):
+        captured_prompts = []
+        if self.replace_cls:
             source = x if pooling_source is None else pooling_source
-            prompt = self.hopfield_pooling_layers[layer_idx](source).reshape(
+            replacement = self.hopfield_pooling_layers[0](source).reshape(
+                batch_size, 1, self.embed_dim
+            )
+            if return_prompts:
+                captured_prompts.append(replacement.detach())
+            x = torch.cat((replacement, x[:, 1:]), dim=1)
+            for block_idx in range(first, depth):
+                x = backbone.blocks[block_idx](x)
+            features = backbone.norm(x)[:, 0]
+            if return_prompts:
+                return features, torch.stack(captured_prompts, dim=1)
+            return features
+        shared_prompt = None
+        if self.prompt_blocks is not None:
+            source = x if pooling_source is None else pooling_source
+            shared_prompt = self.hopfield_pooling_layers[0](source).reshape(
                 batch_size, self.prompt_length, self.embed_dim
             )
-            x = torch.cat((x[:, :1], prompt, x[:, 1:]), dim=1)
+        slot_by_block = {block: slot for slot, block in enumerate(prompt_blocks)}
+        for block_idx in range(first, depth):
+            if block_idx in slot_by_block:
+                if shared_prompt is None:
+                    source = x if pooling_source is None else pooling_source
+                    prompt = self.hopfield_pooling_layers[slot_by_block[block_idx]](source).reshape(
+                        batch_size, self.prompt_length, self.embed_dim
+                    )
+                else:
+                    prompt = shared_prompt
+                if return_prompts:
+                    captured_prompts.append(prompt.detach())
+                x = torch.cat((x[:, :1], prompt, x[:, 1:]), dim=1)
             x = backbone.blocks[block_idx](x)
-            x = torch.cat((x[:, :1], x[:, self.prompt_length + 1:]), dim=1)
-
-        for block_idx in range(last, depth):
-            x = backbone.blocks[block_idx](x)
-        return backbone.norm(x)[:, 0]
+            if block_idx in slot_by_block:
+                x = torch.cat((x[:, :1], x[:, self.prompt_length + 1:]), dim=1)
+        features = backbone.norm(x)[:, 0]
+        if return_prompts:
+            return features, torch.stack(captured_prompts, dim=1)
+        return features
 
 
 class HFPool(FrozenViTClassifier):
@@ -268,8 +393,13 @@ class HFPool(FrozenViTClassifier):
                       prompt_length: int = 10,
                       deep_prompts: int = 0,
                       hopfield_start_layer: Optional[int] = None,
+                      hopfield_prompt_blocks: Optional[Iterable[int]] = None,
+                      hopfield_replace_cls: bool = False,
                       hopfield_input_mode: str = "local",
                       hopfield_trainable: Iterable[str] = ("q",),
+                      hopfield_o_mode: str = "full",
+                      hopfield_lora_rank: int = 8,
+                      hopfield_lora_alpha: float = 8.0,
                       **kwargs) -> nn.Module:
         return HopfieldPoolingPrompts(
             embed_dim=self.embed_dim,
@@ -278,8 +408,14 @@ class HFPool(FrozenViTClassifier):
             prompt_length=prompt_length,
             deep_prompts=deep_prompts,
             start_layer=hopfield_start_layer,
+            prompt_blocks=hopfield_prompt_blocks,
+            replace_cls=hopfield_replace_cls,
             input_mode=hopfield_input_mode,
+            pooling_mode=kwargs.get("hopfield_pooling_mode", "attention"),
             trainable=hopfield_trainable,
+            o_mode=hopfield_o_mode,
+            lora_rank=hopfield_lora_rank,
+            lora_alpha=hopfield_lora_alpha,
         )
 
     @property
@@ -290,3 +426,9 @@ class HFPool(FrozenViTClassifier):
     def prepare_hopfield_context(
             self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.adapter.prepare_full_vit_context(self.backbone, inputs)
+
+    @torch.no_grad()
+    def capture_prompts(self, inputs: torch.Tensor):
+        blocks = self.adapter.resolve_prompt_blocks(len(self.backbone.blocks))
+        _, prompts = self.adapter(self.backbone, inputs, return_prompts=True)
+        return blocks, prompts

@@ -273,6 +273,13 @@ class _Trainer():
 
         logger.info(f"[1] Select a GCL method ({self.method})")
         self.setup_distributed_model()
+        if getattr(self, "paired_training_rng", False):
+            if self.rnd_seed is None:
+                raise ValueError("Paired training RNG requires an explicit seed")
+            random.seed(self.rnd_seed)
+            np.random.seed(self.rnd_seed)
+            torch.manual_seed(self.rnd_seed)
+            torch.cuda.manual_seed_all(self.rnd_seed)
 
         # =========== Incrementally training ===========
         logger.info(f"[2] Incrementally training {self.n_tasks} tasks")
@@ -328,6 +335,11 @@ class _Trainer():
                 test_dataloader = DataLoader(self.test_dataset, batch_size=self.batchsize*2, sampler=test_sampler, num_workers=self.n_worker)
                 eval_dict = self.online_evaluate(test_dataloader, task_id=task_id, end=True)
 
+            # Capture the state that produced this evaluation, before hooks
+            # such as end-of-stream LoRA merging mutate it.
+            save_probe = getattr(self, "save_offline_probe_checkpoint", None)
+            if save_probe is not None:
+                save_probe(task_id, samples_cnt, eval_dict)
             self.online_after_task(task_id)
 
             if self.distributed:
@@ -340,6 +352,8 @@ class _Trainer():
             logger.info("[2-4] Update the information for the current task")
             task_records["task_acc"].append(task_acc)
             task_records["cls_acc"].append(eval_dict["cls_acc"])
+            task_records["seen_class_count"].append(len(self.exposed_classes))
+            task_records["task_end_samples"].append(samples_cnt)
 
             logger.info("[2-5] Report task result")
             logger.info(task_records['task_acc'])
@@ -390,10 +404,29 @@ class _Trainer():
             logger.info(eval_results['test_acc'])
 
             np.save(f"{self.log_dir}/seed_{self.rnd_seed}.npy", task_records["task_acc"])
+            # Keep the class history used by F_last. The scalar log and the
+            # existing overall-accuracy arrays cannot recover its distribution.
+            class_ids = np.full(self.n_classes, -1, dtype=np.int64)
+            class_ids[:len(self.exposed_classes)] = self.exposed_classes
+            seen_mask = np.arange(self.n_classes)[None, :] < np.asarray(
+                task_records["seen_class_count"], dtype=np.int64
+            )[:, None]
+            np.savez_compressed(
+                f"{self.log_dir}/seed_{self.rnd_seed}_class_history.npz",
+                cls_accuracy=np.asarray(task_records["cls_acc"], dtype=np.float64),
+                class_ids=class_ids,
+                seen_mask=seen_mask,
+                task_end_samples=np.asarray(task_records["task_end_samples"], dtype=np.int64),
+                f_last=np.asarray(F_last, dtype=np.float64),
+            )
 
             if self.eval_period != np.inf:
                 np.save(f'{self.log_dir}/seed_{self.rnd_seed}_eval.npy', eval_results['test_acc'])
                 np.save(f'{self.log_dir}/seed_{self.rnd_seed}_eval_time.npy', eval_results['data_cnt'])
+
+            run_probe = getattr(self, "run_offline_probe", None)
+            if run_probe is not None:
+                run_probe()
 
             # Optional post-hoc expert representation analysis (e.g., FlyPrompt/DualPrompt/MVP).
             if getattr(self, "analysis_expert_similarity", False):

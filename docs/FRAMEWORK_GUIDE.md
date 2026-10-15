@@ -206,6 +206,8 @@ bank per expert for `flyprompt`, one global bank for `baseline`,
 | `shared_prompt` | one FlyPrompt prompt shared by the stream | `--len_prompt` `--pos_prompt` `--use_ema` |
 | `hfpool` | selected Hopfield-pooling parts that generate prompts | `--hopfield_trainable {query,q,k,v,o}...` `--hopfield_input_mode {local,full_vit}` `--hopfield_start_layer` `--deep_prompts` `--num_pooling_blocks/heads` `--prompt_length` `--hopfield_grad_clip[_norm]` |
 | `gate` | per-head gain `1 + tanh(alpha)` on attention outputs | `--gate_blocks` |
+| `hfpool_lora` | output-only HFPool LoRA; complete-batch merge/reset by default | `--hopfield_o_mode` `--hopfield_lora_rank/alpha/lr` |
+| `spatial_gelu` | spatial pooling → GELU → output mapping; optional output LoRA | `--num_pooling_blocks` `--hopfield_o_mode` |
 | `mlp_generator` | clean-CLS-conditioned MLP prompt generator with teacher distillation | `--prompt_blocks` `--generator_layers` `--distill_*` … |
 
 ### Old → new commands

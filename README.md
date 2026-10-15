@@ -128,7 +128,7 @@ flowchart LR
 
 ## 实现与阅读入口
 
-本分支包含 [HFPool](models/hfpool.py)、[per-head gate](models/gate.py)、[MLP prompt 生成器及统计回放](models/mlp_generator.py) 和相应训练器。输出 LoRA、空间池化 GELU、分类头回放及 CLS/probe 诊断位于 `labb-backbone-comparison` 实验线。
+本分支包含 [HFPool](models/hfpool.py)、[HFPool 输出 LoRA](models/hfpool_lora.py)、[空间池化 GELU](models/spatial_gelu.py)、[per-head gate](models/gate.py) 和 [MLP prompt 生成器](models/mlp_generator.py)。分类头回放接入在线训练器；Prompt/CLS 几何、检查点快照及离线线性 probe 的计算整理在 `utils/`，独立运行与绘图入口整理在 `scripts/`。具体命令见[方法与诊断指南](docs/METHODS_AND_DIAGNOSTICS.md)。
 
 - [运行环境、数据与方法参数](docs/FRAMEWORK_GUIDE.md)
 - [实验调度器](RUN_V2.md)

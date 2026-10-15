@@ -61,6 +61,16 @@ def base_parser():
     # ========== Evaluation configuration ==========
     parser.add_argument("--topk", type=int, default=1, help="set k when we want to set topk accuracy")
     parser.add_argument("--eval_period", type=int, default=100, help="evaluation period for true online setup")
+    parser.add_argument("--offline_probe", action="store_true",
+                        help="Save task-end frozen-ViT method states and refit linear heads after the stream (one GPU per job).")
+    parser.add_argument("--offline_probe_epochs", type=int, default=100,
+                        help="Maximum probe epochs; validation chooses a budget, then refit on all observed samples.")
+    parser.add_argument("--offline_probe_patience", type=int, default=10)
+    parser.add_argument("--offline_probe_lr", type=float, default=0.001)
+    parser.add_argument("--offline_probe_weight_decay", type=float, default=0.0005)
+    parser.add_argument("--offline_probe_batchsize", type=int, default=256)
+    parser.add_argument("--offline_probe_cache_features", action="store_true",
+                        help="Persist FP32 train/test CLS caches for later CPU-only refitting.")
 
     # ============= ViT configurations =============
     parser.add_argument('--profile', action='store_true', default=False, help='enable profiling for ViT_Prompt')
@@ -92,6 +102,13 @@ def base_parser():
     parser.add_argument("--pos_prompt", type=int, nargs="+", default=[0, 1, 2, 3, 4], help="The position of the prompt")
     parser.add_argument("--rp_dim", type=int, default=10000, help="The dimension of the random projection head")
     parser.add_argument("--rp_ridge", type=float, default=1e4, help="The ridge parameter for the random projection head")
+    parser.add_argument("--cls_probe", action="store_true",
+                        help="Save task-end states and compare final CLS on a fixed observed cohort after the stream.")
+    parser.add_argument("--cls_probe_per_class", type=int, default=16)
+    parser.add_argument("--paired_training_rng", action="store_true",
+                        help="Reset augmentation RNG after model initialization for paired method comparisons.")
+    parser.add_argument("--ema_diagnostics", action="store_true",
+                        help="Maintain EMA heads and log each head and ensemble; primary evaluation stays online unless use_ema.")
     parser.add_argument("--use_ema", action="store_true", default=False,
                         help=(
                             "Ensemble EMA classifier heads with the online FC: one bank per "
@@ -233,8 +250,19 @@ def base_parser():
                         help="Maximum replay variance per clean-CLS dimension.")
     parser.add_argument("--teacher_lags", type=int, nargs="+", default=[1],
                         help="Hard-teacher snapshot lags measured in internal steps, e.g. 1 5.")
+    parser.add_argument("--classifier_replay", action="store_true",
+                        help="Replay detached final-CLS class distributions to distil the online FC of frozen-ViT methods.")
+    parser.add_argument("--classifier_replay_weight_mode",
+                        choices=["fixed", "gradnorm", "learned_gradnorm"], default="fixed",
+                        help=("fixed uses distill_weight; gradnorm reuses the detached ratio controller; "
+                              "learned_gradnorm learns its target ratio, initialized by "
+                              "distill_grad_ratio, with a Bernoulli KL prior toward that initial ratio."))
+    parser.add_argument("--classifier_replay_ratio_reg", type=float, default=1.0,
+                        help="Strength of the KL prior preventing a learned gradient ratio from collapsing to zero.")
 
     # ========== HFPool configurations ==========
+    parser.add_argument("--hopfield_pooling_mode", choices=["attention", "spatial_gelu"], default=None,
+                        help="spatial_gelu uses CLS + 3x3 pooled patch tokens, GELU, and output projection; no Q/K attention.")
     parser.add_argument("--num_pooling_heads", type=int, default=1,
                         help="Attention heads per Hopfield pooling layer.")
     parser.add_argument("--num_pooling_blocks", type=int, default=5,
@@ -245,7 +273,17 @@ def base_parser():
                         help="1 places the pooling blocks at the deepest layers instead of the "
                              "shallowest; ignored when --hopfield_start_layer is set.")
     parser.add_argument("--hopfield_start_layer", type=int, default=None,
-                        help="Zero-based first ViT block that receives a Hopfield prompt.")
+                        help=("Zero-based first ViT block that receives a Hopfield prompt; "
+                              "with explicit hopfield_prompt_blocks, the generation source block instead."))
+    parser.add_argument("--hopfield_prompt_blocks", type=int, nargs="+", default=None,
+                        help=("Explicit zero-based insertion blocks for one HFPool module. "
+                              "Requires --num_pooling_blocks 1; generate once at "
+                              "--hopfield_start_layer (default 0), then reuse the same "
+                              "prompt at every listed block."))
+    parser.add_argument("--hopfield_replace_cls", action="store_true",
+                        help=("Use one HFPool module to replace the CLS token before its source block; "
+                              "requires --num_pooling_blocks 1 and --prompt_length 1. "
+                              "The generated CLS remains through the rest of the ViT."))
     parser.add_argument("--hopfield_input_mode", choices=["local", "full_vit"], default="local",
                         help=(
                             "local pools from the tokens entering each prompted block; full_vit "
@@ -253,21 +291,46 @@ def base_parser():
                             "sequence and requires --online_iter 3."
                         ))
     parser.add_argument("--hopfield_trainable", nargs="+", choices=["query", "q", "k", "v", "o"],
-                        default=["q"],
+                        default=None,
                         help=(
                             "Hopfield parts that receive gradients: query (pooling weights), "
                             "q/k/v (packed input projection slices), o (output projection). "
                             "V is a static identity unless v is listed, in which case an "
                             "identity-initialised projection is trained. Normalisation stays frozen."
                         ))
+    parser.add_argument(
+        "--hopfield_o_mode",
+        choices=["full", "lora", "lora_merge_1024", "lora_merge_batch"],
+        default=None,
+        help=("Output projection training: full W_o, persistent LoRA, or LoRA "
+              "merged into W_o after 1024 seen samples / each complete mini batch. "
+              "LoRA modes require --hopfield_trainable o."),
+    )
+    parser.add_argument("--hopfield_lora_rank", type=int, default=8,
+                        help="Rank of each HFPool output-projection LoRA pair.")
+    parser.add_argument("--hopfield_lora_alpha", type=float, default=8.0,
+                        help="Alpha in the HFPool output update (alpha / rank) * B @ A.")
+    parser.add_argument("--hopfield_lora_lr", type=float, default=0.005,
+                        help="Independent Adam learning rate for HFPool LoRA A/B.")
     parser.add_argument("--hopfield_grad_clip", action="store_true",
                         help="Clip trainable Hopfield gradients after AMP unscaling (stabilises joint training).")
     parser.add_argument("--hopfield_grad_clip_norm", type=float, default=1.0,
                         help="Maximum Hopfield gradient norm used with --hopfield_grad_clip.")
+    parser.add_argument("--prompt_probe_every_batches", type=int, default=0,
+                        help="Record fixed-test-image prompts every N stream mini batches (0 disables).")
+    parser.add_argument("--prompt_probe_examples", type=int, default=8,
+                        help="Number of fixed, distinct-class test images for prompt probes.")
 
     # ========== Gate configurations ==========
     parser.add_argument("--gate_blocks", type=int, nargs="+", default=[0, 1, 2, 3, 4],
                         help="ViT blocks whose attention heads get a learned 1 + tanh(alpha) gain.")
 
     args = parser.parse_args()
+    output_methods = {"hfpool_lora", "spatial_gelu"}
+    if args.hopfield_trainable is None:
+        args.hopfield_trainable = ["o"] if args.method in output_methods else ["q"]
+    if args.hopfield_o_mode is None:
+        args.hopfield_o_mode = "lora_merge_batch" if args.method == "hfpool_lora" else "full"
+    if args.hopfield_pooling_mode is None:
+        args.hopfield_pooling_mode = "spatial_gelu" if args.method == "spatial_gelu" else "attention"
     return args

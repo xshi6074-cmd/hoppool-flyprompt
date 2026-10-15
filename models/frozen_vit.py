@@ -1,4 +1,5 @@
 import logging
+from copy import deepcopy
 from typing import Iterable, Optional
 
 import torch
@@ -25,6 +26,7 @@ class FrozenViTClassifier(nn.Module):
                  num_classes: int = 100,
                  backbone_name: Optional[str] = None,
                  use_ema: bool = False,
+                 ema_diagnostics: bool = False,
                  ema_ratio: Iterable[float] = (0.9, 0.99),
                  **kwargs):
         super().__init__()
@@ -35,9 +37,11 @@ class FrozenViTClassifier(nn.Module):
         self.num_classes = num_classes
         self.task_count = 0
         self.use_ema = bool(use_ema)
+        self.ema_diagnostics = bool(ema_diagnostics)
+        self.has_ema = self.use_ema or self.ema_diagnostics
         self.ema_ratio = [float(ratio) for ratio in ema_ratio]
-        if self.use_ema and not self.ema_ratio:
-            raise ValueError("ema_ratio must not be empty when use_ema=True")
+        if self.has_ema and (not self.ema_ratio or any(not 0 <= r < 1 for r in self.ema_ratio)):
+            raise ValueError("EMA requires nonempty ratios in [0, 1)")
 
         self.backbone = create_backbone(
             backbone_name,
@@ -56,14 +60,19 @@ class FrozenViTClassifier(nn.Module):
         self.adapter = self.build_adapter(**kwargs)
 
         self.ema_fc = None
-        if self.use_ema:
+        if self.has_ema:
             self.ema_fc = nn.ModuleList([
-                nn.Linear(self.embed_dim, num_classes, bias=True)
+                deepcopy(self.backbone.fc)
                 for _ in self.ema_ratio
             ])
             for param in self.ema_fc.parameters():
                 param.requires_grad = False
             self._copy_online_fc_to_ema()
+
+        self.classifier_replay = None
+        if kwargs.get("classifier_replay", False):
+            from models.classifier_replay import ClassifierReplay
+            self.classifier_replay = ClassifierReplay(self.backbone.fc, task_num, **kwargs)
 
     def build_adapter(self, **kwargs) -> Optional[nn.Module]:
         return None
@@ -73,13 +82,21 @@ class FrozenViTClassifier(nn.Module):
             return self.backbone.forward_features(inputs)[:, 0]
         return self.adapter(self.backbone, inputs, **kwargs)
 
-    def forward(self, inputs: torch.Tensor, **kwargs) -> torch.Tensor:
-        return self.backbone.fc(self.extract_features(inputs, **kwargs))
+    def forward(self, inputs: torch.Tensor, return_replay=False, replay_active=False, **kwargs):
+        features = self.extract_features(inputs, **kwargs)
+        logits = self.backbone.fc(features)
+        if not return_replay:
+            return logits
+        if self.classifier_replay is None:
+            raise ValueError("return_replay requires --classifier_replay")
+        replay_loss = (self.classifier_replay.loss(self.backbone.fc) if replay_active else
+                       logits.new_zeros(()))
+        return logits, features.detach(), replay_loss
 
     def forward_with_ema(self, inputs: torch.Tensor, **kwargs):
         features = self.extract_features(inputs, **kwargs)
         outputs = [self.backbone.fc(features)]
-        if self.use_ema:
+        if self.has_ema:
             outputs.extend(fc(features) for fc in self.ema_fc)
         return outputs
 
@@ -91,7 +108,7 @@ class FrozenViTClassifier(nn.Module):
 
     @torch.no_grad()
     def update_ema_fc(self):
-        if not self.use_ema:
+        if not self.has_ema:
             return
         online_fc = self.backbone.fc
         for fc, ratio in zip(self.ema_fc, self.ema_ratio):
@@ -99,6 +116,8 @@ class FrozenViTClassifier(nn.Module):
             fc.bias.mul_(ratio).add_(online_fc.bias, alpha=1.0 - ratio)
 
     def process_task_count(self):
+        if self.classifier_replay is not None and self.classifier_replay.enabled:
+            self.classifier_replay.snapshot(self.backbone.fc)
         self.task_count += 1
 
     def update(self):

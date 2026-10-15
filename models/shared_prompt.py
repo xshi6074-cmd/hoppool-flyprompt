@@ -30,3 +30,9 @@ class SharedPrompt(FrozenViTClassifier):
             inputs.size(0), device=inputs.device, dtype=torch.long
         )
         return self.adapter(self.backbone, inputs, expert_ids)
+
+    @torch.no_grad()
+    def capture_prompts(self, inputs: torch.Tensor):
+        expert_ids = torch.zeros(inputs.size(0), device=inputs.device, dtype=torch.long)
+        prompts = self.adapter._build_batched_prompts(self.backbone, expert_ids)
+        return tuple(self.adapter.pos_prompt.tolist()), prompts
