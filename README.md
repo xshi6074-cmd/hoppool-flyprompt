@@ -1,4 +1,4 @@
-# 用生成式参数化学习实现在线适应
+# online场景下“生成式”持续学习
 
 **Generative parameterization for online adaptation — prompt generation, statistical replay, and mechanism analysis.**
 
