@@ -325,8 +325,8 @@ add_generator_distill_suite() {
         --anchors_per_class 8
 }
 
-add_generator_distill_suite "cifar100" "cifar100" "$CIFAR_DATA_DIR"
-add_generator_distill_suite "cub200" "cub200" "$CUB_DATA_DIR"
+# add_generator_distill_suite "cifar100" "cifar100" "$CIFAR_DATA_DIR"
+# add_generator_distill_suite "cub200" "cub200" "$CUB_DATA_DIR"
 
 # =============================================================================
 # SCHEDULER IMPLEMENTATION
