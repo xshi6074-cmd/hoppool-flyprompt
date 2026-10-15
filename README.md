@@ -68,7 +68,7 @@ flowchart LR
 $$
 \mathbb{E}\|\Delta Wz+\Delta b\|_2^2
 =\|\Delta W\mu+\Delta b\|_2^2
-+\operatorname{tr}(\Delta W\Sigma\Delta W^\top).
++\mathrm{tr}(\Delta W\Sigma\Delta W^\top).
 $$
 
 这个表达式把回放约束分成均值处的输出差异与分布变化方向上的差异，并消除了伪特征采样带来的估计噪声。实验据此比较了对角/低秩统计、采样/闭式期望、MSE/cosine，以及它们与当前学习目标的梯度比例。
@@ -82,13 +82,13 @@ $$
 **输入相关的 prompt 通过什么作用改善模型适应？** 从 attention 的形式看，它同时改变原有内容的权重分配，并提供新的 value 贡献。对单个 head，在固定当前 query、原有 keys/values 且关闭 dropout 时，按原有 tokens 与 prompt tokens 拆开 softmax 求和，可得：
 
 $$
-\operatorname{Attn}(q,[K_x;K_p],[V_x;V_p])
+\mathrm{Attn}(q,[K_x;K_p],[V_x;V_p])
 =(1-\gamma(q))\,a_x(q)+\gamma(q)\,a_p(q),
 $$
 
 $$
-a_x(q)=\operatorname{softmax}(qK_x^\top/\sqrt{d_h})V_x,\qquad
-a_p(q)=\operatorname{softmax}(qK_p^\top/\sqrt{d_h})V_p,
+a_x(q)=\mathrm{softmax}(qK_x^\top/\sqrt{d_h})V_x,\qquad
+a_p(q)=\mathrm{softmax}(qK_p^\top/\sqrt{d_h})V_p,
 $$
 
 $$
